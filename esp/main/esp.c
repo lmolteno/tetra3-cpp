@@ -9,9 +9,10 @@
 #include "http_server.h"
 #include "wifi_manager.h"
 #include "star_solver.h"
-#include "star_catalog.h"
-#include "pattern_catalog.h"
-// #include "example_catalogs.h"
+// #include "star_catalog.h"
+// #include "pattern_catalog.h"
+#include "example_catalogs.h"
+#include "oled_display.h"
 
 // Define your WiFi credentials here - replace with your network
 // #define WIFI_SSID "Farm"
@@ -32,6 +33,15 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Initialize OLED display early for boot messages
+    ESP_LOGI(TAG, "Initializing OLED display...");
+    if (oled_display_init() == ESP_OK) {
+        oled_display_hello_world();
+        ESP_LOGI(TAG, "OLED display initialized and hello message shown");
+    } else {
+        ESP_LOGW(TAG, "OLED display initialization failed - continuing without display");
+    }
 
     // Initialize WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
@@ -112,4 +122,5 @@ void app_main(void)
     star_solver_destroy(solver);
     camera_ops_deinit();
     wifi_manager_deinit();
+    oled_display_deinit();
 }

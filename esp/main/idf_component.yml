@@ -3,3 +3,6 @@ dependencies:
     version: 2.1.2
   espressif/eigen:
     version: 3.4.0~2
+  quackonauty/esp_ssd1306:
+    git: https://github.com/quackonauty/ESP-IDF-ESP_SSD1306.git
+    version: v1.0.1

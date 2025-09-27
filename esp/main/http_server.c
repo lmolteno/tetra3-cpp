@@ -2,9 +2,9 @@
 #include "camera_ops.h"
 #include "star_solver.h"
 #include "star_detection.h"
-#include "star_catalog.h"
-#include "pattern_catalog.h"
-// #include "example_catalogs.h"
+// #include "star_catalog.h"
+// #include "pattern_catalog.h"
+#include "example_catalogs.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <string.h>
