@@ -1,5 +1,5 @@
 dependencies:
   espressif/esp32-camera:
-    version: '2.1.2'
+    version: 2.1.2
   espressif/eigen:
-    version: '3.4.0~2'
+    version: 3.4.0~2

@@ -47,7 +47,7 @@ static camera_config_t camera_config = {
     // Astrophotography optimizations
     .xclk_freq_hz = 40000000,
     .pixel_format = PIXFORMAT_GRAYSCALE, // Monochrome for maximum light sensitivity
-    .frame_size = FRAMESIZE_VGA,         // 640x480 for good balance of detail and memory
+    .frame_size = FRAMESIZE_UXGA,         // 640x480 for good balance of detail and memory
     .jpeg_quality = 12,
     .fb_count = 1,
     .fb_location = CAMERA_FB_IN_PSRAM,
@@ -63,6 +63,8 @@ esp_err_t camera_ops_init(void)
         ESP_LOGE(TAG, "Camera init failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    return ESP_OK;
 
     sensor_t* s = esp_camera_sensor_get();
     if (!s) {

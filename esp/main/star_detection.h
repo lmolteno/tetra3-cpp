@@ -21,6 +21,9 @@ star_detection_result_t* detect_stars_simple(const camera_fb_t* fb,
                                             int min_area,         // minimum cluster size (default: 3)
                                             int max_stars);       // maximum stars to detect (default: 100)
 
+// Test star detection with hardcoded positions (rescaled from 1600x1200 to current image size)
+star_detection_result_t* detect_stars_test(const camera_fb_t* fb);
+
 // Free star detection results
 void star_detection_free(star_detection_result_t* result);
 

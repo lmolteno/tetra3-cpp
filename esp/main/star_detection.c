@@ -326,6 +326,68 @@ star_detection_result_t* detect_stars_simple(const camera_fb_t* fb,
     return result;
 }
 
+star_detection_result_t* detect_stars_test(const camera_fb_t* fb)
+{
+    if (!fb) {
+        ESP_LOGE(TAG, "Invalid frame buffer");
+        return NULL;
+    }
+
+    // Hardcoded star positions from 1600x1200 image
+    const float reference_stars[][2] = {
+        {692.4872f, 491.22507f},
+        {946.2311f, 332.36243f},
+        {12.089273f, 442.55933f},
+        {943.6792f, 298.08932f},
+        {734.17804f, 297.76077f},
+        {1335.9685f, 518.3289f},
+        {1374.8608f, 493.86456f},
+        {905.30676f, 585.91943f},
+        {1098.4895f, 316.72595f},
+        {419.94678f, 1107.7972f}
+    };
+    const int num_reference_stars = sizeof(reference_stars) / sizeof(reference_stars[0]);
+
+    // Calculate scaling factors
+    const float reference_width = 1600.0f;
+    const float reference_height = 1200.0f;
+    const float scale_x = (float)fb->width / reference_width;
+    const float scale_y = (float)fb->height / reference_height;
+
+    ESP_LOGI(TAG, "Test star detection: scaling from %dx%d to %dx%d (scale: %.3f, %.3f)",
+             (int)reference_width, (int)reference_height, fb->width, fb->height, scale_x, scale_y);
+
+    // Allocate result structure
+    star_detection_result_t* result = malloc(sizeof(star_detection_result_t));
+    if (!result) {
+        ESP_LOGE(TAG, "Failed to allocate result structure");
+        return NULL;
+    }
+
+    result->num_centroids = num_reference_stars;
+    result->centroids = malloc(num_reference_stars * sizeof(centroid_t));
+    result->sizes = malloc(num_reference_stars * sizeof(float));
+
+    if (!result->centroids || !result->sizes) {
+        ESP_LOGE(TAG, "Failed to allocate centroid arrays");
+        star_detection_free(result);
+        return NULL;
+    }
+
+    // Scale and copy the reference stars
+    for (int i = 0; i < num_reference_stars; i++) {
+        result->centroids[i].x = reference_stars[i][1] * scale_x;
+        result->centroids[i].y = reference_stars[i][0] * scale_y;
+        result->sizes[i] = 100.0f;  // Fixed size for test stars
+
+        ESP_LOGI(TAG, "Test star %d: center=(%.1f, %.1f), size=%.0f",
+                i + 1, result->centroids[i].x, result->centroids[i].y, result->sizes[i]);
+    }
+
+    ESP_LOGI(TAG, "Generated %d test stars", num_reference_stars);
+    return result;
+}
+
 void star_detection_free(star_detection_result_t* result)
 {
     if (!result) return;

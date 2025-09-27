@@ -11,10 +11,13 @@
 #include "star_solver.h"
 #include "star_catalog.h"
 #include "pattern_catalog.h"
+// #include "example_catalogs.h"
 
 // Define your WiFi credentials here - replace with your network
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASS "YOUR_WIFI_PASS"
+// #define WIFI_SSID "Farm"
+// #define WIFI_PASS "ragamuffin"
+#define WIFI_SSID "Geocam"
+#define WIFI_PASS "geocam360wifi"
 
 static const char* TAG = "astro_explorer";
 
