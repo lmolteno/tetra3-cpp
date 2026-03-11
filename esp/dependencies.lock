@@ -37,18 +37,9 @@ dependencies:
     source:
       type: idf
     version: 5.5.1
-  quackonauty/esp_ssd1306:
-    component_hash: 2ec9af1c61cf0a011855b6df8c102fa1241179c86c3fec9e2696809828bf1d73
-    dependencies: []
-    source:
-      git: https://github.com/quackonauty/ESP-IDF-ESP_SSD1306.git
-      path: .
-      type: git
-    version: 5a09b49bca90bcb153d166761b678782e52d877f
 direct_dependencies:
 - espressif/eigen
 - espressif/esp32-camera
-- quackonauty/esp_ssd1306
-manifest_hash: 44c78ab4d416eea88312d57f4092983365599634f9fef1e4d655b71967cc3d4f
+manifest_hash: 5f9fc06824095e5f125bdd216826ae21758cc25412c5e91b0b4345e44bd9b619
 target: esp32s3
 version: 2.0.0

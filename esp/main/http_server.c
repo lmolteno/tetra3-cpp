@@ -2,9 +2,9 @@
 #include "camera_ops.h"
 #include "star_solver.h"
 #include "star_detection.h"
-// #include "star_catalog.h"
-// #include "pattern_catalog.h"
-#include "example_catalogs.h"
+#include "star_catalog.h"
+#include "pattern_catalog.h"
+// #include "example_catalogs.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <string.h>
@@ -459,8 +459,8 @@ static esp_err_t solve_handler(httpd_req_t *req)
             solver,
             detection->centroids, detection->num_centroids,
             fb->height, fb->width,    // height, width
-            7.0,                     // fov_estimate_deg
-            16,                        // pattern_checking_stars
+            30.0,                     // fov_estimate_deg
+            50,                       // pattern_checking_stars
             0.01f,                    // match_radius
             0.001f,                   // match_threshold
             false,                    // use_distortion
@@ -648,8 +648,8 @@ static esp_err_t capture_solve_handler(httpd_req_t *req)
         solver,
         detection->centroids, detection->num_centroids,
         fb->height, fb->width,    // height, width
-        20.0,                     // fov_estimate_deg
-        8,                        // pattern_checking_stars
+        30.0,                     // fov_estimate_deg
+        16,                        // pattern_checking_stars
         0.01f,                    // match_radius
         0.001f,                   // match_threshold
         false,                    // use_distortion
