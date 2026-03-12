@@ -100,11 +100,12 @@ def write_star_header(stars, output_file):
 
     with open(output_file, 'w') as f:
         f.write('#pragma once\n\n')
-        f.write('#include "star_solver.h"\n\n')
+        f.write('#include "star_solver.h"\n')
+        f.write('#include "esp_attr.h"\n\n')
         f.write('// Auto-generated star catalog header\n')
         f.write('// DO NOT EDIT MANUALLY\n\n')
         f.write(f'#define STAR_CATALOG_SIZE {len(stars)}\n\n')
-        f.write('static const star_entry_t star_catalog[] = {\n')
+        f.write('static const star_entry_t EXT_RAM_BSS_ATTR star_catalog[] = {\n')
 
         # Write stars in chunks to avoid overly long lines
         for i, star in enumerate(stars):
@@ -131,11 +132,12 @@ def write_pattern_header(patterns, output_file):
 
     with open(output_file, 'w') as f:
         f.write('#pragma once\n\n')
-        f.write('#include "star_solver.h"\n\n')
+        f.write('#include "star_solver.h"\n')
+        f.write('#include "esp_attr.h"\n\n')
         f.write('// Auto-generated pattern catalog header\n')
         f.write('// DO NOT EDIT MANUALLY\n\n')
         f.write(f'#define PATTERN_CATALOG_SIZE {len(patterns)}\n\n')
-        f.write('static const pattern_entry_t pattern_catalog[] = {\n')
+        f.write('static const pattern_entry_t EXT_RAM_BSS_ATTR pattern_catalog[] = {\n')
 
         # Write patterns in chunks
         for i, pattern in enumerate(patterns):
@@ -162,7 +164,7 @@ def main():
 
     # Define paths
     script_dir = Path(__file__).parent
-    tracker_dir = script_dir.parent / "tracker"
+    tracker_dir = script_dir
     esp_main_dir = script_dir / "esp" / "main"
 
     star_binary = tracker_dir / "tetra3_db_stars.bin"

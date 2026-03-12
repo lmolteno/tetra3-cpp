@@ -3,7 +3,7 @@ import matplotlib.image as mpimg
 import numpy as np
 
 # Load and display the image
-img = mpimg.imread('accumulated.jpg')
+img = mpimg.imread('2seconds.jpg')
 if len(img.shape) == 3:
     img = np.mean(img, axis=2)  # Convert to grayscale if needed
 
@@ -16,7 +16,7 @@ img_clipped = np.clip(img_median_sub, 0, None)
 img_scaled = (img_clipped / img_clipped.max()) * 255
 
 # Create binary mask for pixels above 28
-binary_mask = img_scaled > 28
+binary_mask = img_scaled > 40
 
 # Simple flood fill to find connected components
 def flood_fill(mask, start_y, start_x, visited):
@@ -63,8 +63,9 @@ for cluster in clusters:
     centroids.append((cy, cx, len(cluster)))
 
 print(f"Found {len(clusters)} star clusters")
-for i, (cy, cx, size) in enumerate(centroids):
-    print(f"Star {i+1}: center=({cx:.1f}, {cy:.1f}), size={size} pixels")
+for i, (cy, cx, size) in enumerate(sorted(centroids, key=lambda c: c[2], reverse=True)[:10]):
+    print(f"{{{cy:.4f}, {cx:.4f}}},")
+    # print(f"Star {i+1}: center=({cx:.1f}, {cy:.1f}), size={size} pixels")
 
 # Visualize
 plt.figure(figsize=(10, 6))
@@ -72,7 +73,7 @@ plt.imshow(binary_mask, cmap='gray')
 plt.title(f'Binary Mask with {len(centroids)} Star Centers')
 
 # Plot centroids
-for cy, cx, size in centroids:
+for cy, cx, size in sorted(centroids, key=lambda c: c[2], reverse=True)[:10]:
     plt.plot(cx, cy, 'r+', markersize=10, markeredgewidth=2)
     plt.text(cx+5, cy, f'{size}', color='red', fontsize=8)
 
