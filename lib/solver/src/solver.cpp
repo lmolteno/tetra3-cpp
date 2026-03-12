@@ -809,6 +809,64 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                     }
                                     float residual_arcsec = rmse_rad * 180.0f / M_PI * 3600.0f;
 
+                                    // Outlier rejection: remove matches with residual > 3x median
+                                    if (angles_residual_rad.size() > 6) {
+                                        std::vector<float> sorted_res = angles_residual_rad;
+                                        std::sort(sorted_res.begin(), sorted_res.end());
+                                        float median_res = sorted_res[sorted_res.size() / 2];
+                                        float outlier_thresh = 3.0f * std::max(median_res, 1e-6f);
+
+                                        std::vector<Centroid> inlier_img_c;
+                                        std::vector<std::array<double, 3>> inlier_cat_v;
+                                        for (size_t idx = 0; idx < angles_residual_rad.size(); idx++) {
+                                            if (angles_residual_rad[idx] <= outlier_thresh) {
+                                                inlier_img_c.push_back(image_centroids_undist[idx]);
+                                                inlier_cat_v.push_back(matched_catalog_vectors[idx]);
+                                            }
+                                        }
+
+                                        if (inlier_img_c.size() >= 4 && inlier_img_c.size() < angles_residual_rad.size()) {
+                                            int n_rejected = angles_residual_rad.size() - inlier_img_c.size();
+                                            std::cout << "Outlier rejection: removed " << n_rejected << " matches" << std::endl;
+
+                                            auto inlier_img_v = compute_vectors(inlier_img_c, height, width, fov);
+                                            auto rot = find_rotation_matrix(inlier_img_v, inlier_cat_v);
+                                            for (int rr = 0; rr < 3; rr++)
+                                                for (int cc = 0; cc < 3; cc++)
+                                                    rotation_matrix_eigen(rr, cc) = rot[rr][cc];
+
+                                            boresight_x = rotation_matrix_eigen(0, 0);
+                                            boresight_y = rotation_matrix_eigen(0, 1);
+                                            boresight_z = rotation_matrix_eigen(0, 2);
+                                            ra = std::atan2(boresight_y, boresight_x);
+                                            if (ra < 0) ra += 2.0f * M_PI;
+                                            dec = std::asin(std::max(-1.0f, std::min(1.0f, boresight_z)));
+                                            roll = std::atan2(rotation_matrix_eigen(1, 2), rotation_matrix_eigen(2, 2));
+                                            if (roll < 0) roll += 2.0f * M_PI;
+
+                                            // Recompute residuals from inliers
+                                            Eigen::MatrixXf inlier_eigen(inlier_img_v.size(), 3);
+                                            for (size_t r = 0; r < inlier_img_v.size(); r++)
+                                                for (int c = 0; c < 3; c++)
+                                                    inlier_eigen(r, c) = inlier_img_v[r][c];
+                                            Eigen::MatrixXf rotated_inlier = inlier_eigen * rotation_matrix_eigen;
+
+                                            sum_angle_sq = 0.0f;
+                                            angles_residual_rad.clear();
+                                            for (int r = 0; r < rotated_inlier.rows(); r++) {
+                                                std::array<double, 3> rv = {rotated_inlier(r, 0), rotated_inlier(r, 1), rotated_inlier(r, 2)};
+                                                float d = vector_distance(rv, inlier_cat_v[r]);
+                                                float a = 2.0f * std::asin(std::min(1.0f, d / 2.0f));
+                                                angles_residual_rad.push_back(a);
+                                                sum_angle_sq += a * a;
+                                            }
+
+                                            num_star_matches = static_cast<int>(inlier_img_c.size());
+                                            rmse_rad = std::sqrt(sum_angle_sq / angles_residual_rad.size());
+                                            residual_arcsec = rmse_rad * 180.0f / M_PI * 3600.0f;
+                                        }
+                                    }
+
                                     auto end_time = std::chrono::high_resolution_clock::now();
                                     std::chrono::duration<double, std::milli> solve_time = end_time - start_time;
 

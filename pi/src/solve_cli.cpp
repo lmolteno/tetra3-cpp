@@ -120,7 +120,10 @@ int main(int argc, char *argv[]) {
             crop_centroids, ch, cw, crop_fov_deg, 16,
             0.01f, 1e-6f, std::nullopt, crop_fov_deg * 0.2f);
 
-        if (result.solved && result.num_matches >= 10) {
+        // Accept crop solve if enough matches AND sub-pixel RMSE.
+        // Max RMSE: 1 pixel worth of arcsec = crop_fov / crop_width * 3600.
+        float max_crop_rmse = crop_fov_deg * 3600.0f / cw;
+        if (result.solved && result.num_matches >= 6 && result.rmse < max_crop_rmse) {
             // Scale crop FOV back to full-image FOV
             result.fov = 2.0f * std::atan(
                 std::tan(result.fov / 2.0f) * frame.width / cw);

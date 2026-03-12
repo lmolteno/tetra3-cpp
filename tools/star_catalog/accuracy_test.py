@@ -82,7 +82,8 @@ def run_test(solver_path, db_stars, db_patterns, fov, trials, fields):
             if result.get("solved"):
                 err_ra = (result["ra_deg"] - ra + 180) % 360 - 180
                 err_dec = result["dec_deg"] - dec
-                err = np.sqrt(err_ra**2 + err_dec**2)
+                # Correct RA difference for cos(dec) to get true angular error
+                err = np.sqrt((err_ra * np.cos(np.radians(dec)))**2 + err_dec**2)
                 # Reject obvious false matches
                 if err < 10:
                     errors.append(err)
