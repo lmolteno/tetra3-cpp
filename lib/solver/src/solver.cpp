@@ -324,7 +324,6 @@ std::vector<uint64_t> SimpleStarSolver::get_table_indices_from_hash(uint64_t has
         }
 
         if (probe > 1000) {
-            std::cout << "Warning: Excessive probing, breaking at " << probe << std::endl;
             break;
         }
     }
@@ -421,6 +420,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     }
 
     double fov = fov_estimate_deg * M_PI / 180.0;
+    const double fov_initial = fov;
     double fov_max_error_rad = fov_max_error_deg > 0
         ? fov_max_error_deg * M_PI / 180.0
         : 0.0;
@@ -436,88 +436,114 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     int num_extracted_stars_raw = centroids.size();
     int max_stars_to_check = std::min(num_extracted_stars_raw, pattern_checking_stars);
 
+    // Pre-compute star vectors for pattern-checking stars (avoids redundant work per combo)
+    std::vector<std::array<double, 3>> precomputed_vectors;
+    {
+        std::vector<Centroid> check_centroids(centroids.begin(),
+                                               centroids.begin() + max_stars_to_check);
+        precomputed_vectors = compute_vectors(check_centroids, height, width, fov);
+    }
+
+    // Pre-compute hash powers: pattern_bins^0 .. pattern_bins^4
+    const uint64_t hp0 = 1;
+    const uint64_t hp1 = pattern_bins;
+    const uint64_t hp2 = hp1 * pattern_bins;
+    const uint64_t hp3 = hp2 * pattern_bins;
+    const uint64_t hp4 = hp3 * pattern_bins;
+    const uint64_t table_size = pattern_catalog.size();
+
     for (int i = 0; i < max_stars_to_check - 3; i++) {
         for (int j = i + 1; j < max_stars_to_check - 2; j++) {
             for (int k = j + 1; k < max_stars_to_check - 1; k++) {
                 for (int l = k + 1; l < max_stars_to_check; l++) {
-                    std::vector<Centroid> pattern_centroids = {
-                        centroids[i], centroids[j], centroids[k], centroids[l]
+                    fov = fov_initial; // Reset for each pattern attempt
+                    // Compute 6 edge angles from precomputed vectors
+                    const auto &vi = precomputed_vectors[i];
+                    const auto &vj = precomputed_vectors[j];
+                    const auto &vk = precomputed_vectors[k];
+                    const auto &vl = precomputed_vectors[l];
+
+                    std::array<double, 6> edges = {
+                        vector_angle(vi, vj), vector_angle(vi, vk), vector_angle(vi, vl),
+                        vector_angle(vj, vk), vector_angle(vj, vl), vector_angle(vk, vl)
                     };
-                    auto pattern_vectors = compute_vectors(pattern_centroids, height, width, fov);
-                    auto edge_ratios = calculate_edge_ratios(pattern_vectors);
-                    auto hash_code_list = generate_hash_code_combinations(
-                        edge_ratios, pattern_bins, pattern_max_error);
+                    std::sort(edges.begin(), edges.end());
+                    double largest_edge = edges[5];
+                    if (largest_edge < 1e-9) continue;
 
-                    auto hash_indices = key_to_index(hash_code_list, pattern_bins, pattern_catalog.size());
+                    std::array<double, 5> edge_ratios;
+                    for (int d = 0; d < 5; d++) edge_ratios[d] = edges[d] / largest_edge;
 
-                    for (auto hash_index: hash_indices) {
-                        std::vector<uint64_t> hash_match_indices = get_table_indices_from_hash(
-                            hash_index, pattern_catalog.size());
+                    // Compute hash bin ranges and generate indices inline (no heap alloc)
+                    std::array<int, 5> bmin, bmax;
+                    for (int d = 0; d < 5; d++) {
+                        bmin[d] = std::max(0, static_cast<int>((edge_ratios[d] - pattern_max_error) * pattern_bins));
+                        bmax[d] = std::min(pattern_bins - 1, static_cast<int>((edge_ratios[d] + pattern_max_error) * pattern_bins));
+                    }
 
-                        if (hash_match_indices.empty()) {
-                            continue;
-                        }
+                    std::array<uint64_t, 64> hash_buf;
+                    int n_hashes = 0;
+                    for (int d0 = bmin[0]; d0 <= bmax[0]; d0++)
+                    for (int d1 = bmin[1]; d1 <= bmax[1]; d1++)
+                    for (int d2 = bmin[2]; d2 <= bmax[2]; d2++)
+                    for (int d3 = bmin[3]; d3 <= bmax[3]; d3++)
+                    for (int d4 = bmin[4]; d4 <= bmax[4]; d4++) {
+                        std::array<int, 5> key = {d0, d1, d2, d3, d4};
+                        std::sort(key.begin(), key.end());
+                        uint64_t h = key[0]*hp0 + key[1]*hp1 + key[2]*hp2 + key[3]*hp3 + key[4]*hp4;
+                        h = (h * MAGIC_RAND) % table_size;
+                        if (n_hashes < 64) hash_buf[n_hashes++] = h;
+                    }
+                    std::sort(hash_buf.begin(), hash_buf.begin() + n_hashes);
+                    n_hashes = static_cast<int>(std::unique(hash_buf.begin(), hash_buf.begin() + n_hashes) - hash_buf.begin());
 
-                        for (uint64_t catalog_index: hash_match_indices) {
-                            const auto &catalog_pattern = pattern_catalog[catalog_index];
+                    for (int hi = 0; hi < n_hashes; hi++) {
+                        // Inline hash probing (avoids vector allocation)
+                        uint64_t hash_index = hash_buf[hi];
+                        for (uint64_t probe = 0; probe < table_size && probe <= 1000; probe++) {
+                            uint64_t probed_index = (hash_index + probe * probe) % table_size;
+                            const auto &catalog_pattern = pattern_catalog[probed_index];
 
-                            std::vector<std::array<double, 3>> catalog_vectors;
-                            bool valid_catalog_pattern = true;
+                            bool is_empty = true;
+                            for (int x = 0; x < 4; x++) {
+                                if (catalog_pattern.star_indices[x] != 0) { is_empty = false; break; }
+                            }
+                            if (is_empty) break;
 
-                            for (int idx: catalog_pattern.star_indices) {
+                            // Build catalog vectors
+                            std::array<std::array<double, 3>, 4> cat_v;
+                            bool valid = true;
+                            for (int x = 0; x < 4; x++) {
+                                auto idx = catalog_pattern.star_indices[x];
                                 if (static_cast<size_t>(idx) < star_catalog.size()) {
                                     const auto &star = star_catalog[idx];
-                                    catalog_vectors.push_back({star.x, star.y, star.z});
-                                } else {
-                                    valid_catalog_pattern = false;
-                                    break;
-                                }
+                                    cat_v[x] = {star.x, star.y, star.z};
+                                } else { valid = false; break; }
                             }
+                            if (!valid) continue;
 
-                            if (!valid_catalog_pattern || catalog_vectors.size() != 4) {
-                                continue;
-                            }
-
+                            // Verify edge ratios against catalog
+                            std::vector<std::array<double, 3>> catalog_vectors(cat_v.begin(), cat_v.end());
                             auto catalog_edge_ratios = calculate_edge_ratios(catalog_vectors);
 
                             bool match = true;
-                            float max_error = 0.0f;
-                            for (size_t m = 0; m < edge_ratios.size() && m < catalog_edge_ratios.size(); m++) {
-                                float error = std::abs(edge_ratios[m] - catalog_edge_ratios[m]);
-                                max_error = std::max(max_error, error);
-                                if (error > pattern_max_error) {
+                            for (size_t m = 0; m < 5 && m < catalog_edge_ratios.size(); m++) {
+                                if (std::abs(edge_ratios[m] - catalog_edge_ratios[m]) > pattern_max_error) {
                                     match = false;
                                     break;
                                 }
                             }
 
                             if (match) {
-                                std::cout << "Pattern match found! Max error: " << std::fixed <<
-                                        std::setprecision(7) << max_error << std::endl;
-
-                                float catalog_largest_edge = 0;
-                                for (int p = 0; p < 4; p++) {
+                                float catalog_largest_edge_val = 0;
+                                for (int p = 0; p < 4; p++)
                                     for (int q = p + 1; q < 4; q++) {
                                         float angle = vector_angle(catalog_vectors[p], catalog_vectors[q]);
-                                        if (angle > catalog_largest_edge) {
-                                            catalog_largest_edge = angle;
-                                        }
+                                        if (angle > catalog_largest_edge_val) catalog_largest_edge_val = angle;
                                     }
-                                }
 
-                                float image_largest_edge = 0;
-                                for (int p = 0; p < 4; p++) {
-                                    for (int q = p + 1; q < 4; q++) {
-                                        float angle = vector_angle(pattern_vectors[p], pattern_vectors[q]);
-                                        if (angle > image_largest_edge) {
-                                            image_largest_edge = angle;
-                                        }
-                                    }
-                                }
-
-                                if (image_largest_edge > 0.001f) {
-                                    double new_fov = catalog_largest_edge / image_largest_edge * fov;
-                                    // Reject if rescaled FOV is unreasonably far from estimate
+                                if (largest_edge > 0.001) {
+                                    double new_fov = catalog_largest_edge_val / largest_edge * fov_initial;
                                     if (fov_max_error_rad > 0 &&
                                         std::abs(new_fov - fov_estimate_deg * M_PI / 180.0) > fov_max_error_rad) {
                                         continue;
@@ -525,7 +551,10 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                     fov = new_fov;
                                 }
 
-                                pattern_vectors = compute_vectors(pattern_centroids, height, width, fov);
+                                std::vector<Centroid> pattern_centroids = {
+                                    centroids[i], centroids[j], centroids[k], centroids[l]
+                                };
+                                auto pattern_vectors = compute_vectors(pattern_centroids, height, width, fov);
 
                                 auto sorted_image_vectors = sort_pattern_by_centroid(pattern_vectors);
                                 auto sorted_catalog_vectors = catalog_vectors;
@@ -624,9 +653,6 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                 int num_nearby_catalog_stars = nearby_star_centroids.size();
                                 int num_star_matches = matched_stars.size();
 
-                                std::cout << "Number of nearby stars: " << num_nearby_catalog_stars
-                                        << ", total matched: " << num_star_matches << std::endl;
-
                                 long double prob_single_star_mismatch = static_cast<long double>(
                                                                             num_nearby_catalog_stars) * static_cast<
                                                                             long double>(match_radius) *
@@ -638,14 +664,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
 
                                 long double prob_mismatch = calculate_binomial_cdf(k_binom, n_binom, p_binom);
 
-                                std::cout << "Mismatch probability = " << std::scientific << std::setprecision(2) <<
-                                        prob_mismatch
-                                        << ", at FOV = " << std::fixed << std::setprecision(5) << fov * 180.0 /
-                                        M_PI <<
-                                        "deg" << std::endl;
-
                                 if (prob_mismatch < match_threshold) {
-                                    std::cout << "MATCH ACCEPTED" << std::endl;
 
                                     std::vector<Centroid> matched_image_centroids;
                                     matched_image_centroids.reserve(num_star_matches);
@@ -827,8 +846,6 @@ SolveResult SimpleStarSolver::solve_from_centroids(
 
                                         if (inlier_img_c.size() >= 4 && inlier_img_c.size() < angles_residual_rad.size()) {
                                             int n_rejected = angles_residual_rad.size() - inlier_img_c.size();
-                                            std::cout << "Outlier rejection: removed " << n_rejected << " matches" << std::endl;
-
                                             auto inlier_img_v = compute_vectors(inlier_img_c, height, width, fov);
                                             auto rot = find_rotation_matrix(inlier_img_v, inlier_cat_v);
                                             for (int rr = 0; rr < 3; rr++)
@@ -869,17 +886,6 @@ SolveResult SimpleStarSolver::solve_from_centroids(
 
                                     auto end_time = std::chrono::high_resolution_clock::now();
                                     std::chrono::duration<double, std::milli> solve_time = end_time - start_time;
-
-                                    std::cout << "Solution found!" << std::endl;
-                                    std::cout << "RA: " << ra * 180.0f / M_PI << " degrees" << std::endl;
-                                    std::cout << "Dec: " << dec * 180.0f / M_PI << " degrees" << std::endl;
-                                    std::cout << "Roll: " << roll * 180.0f / M_PI << " degrees" << std::endl;
-                                    std::cout << "FOV: " << fov * 180.0 / M_PI << " degrees" << std::endl;
-                                    std::cout << "Matches: " << num_star_matches << std::endl;
-                                    std::cout << "RMSE: " << std::fixed << std::setprecision(3) <<
-                                            residual_arcsec << " arcsec" << std::endl;
-                                    std::cout << "Solve time: " << std::fixed << std::setprecision(3) <<
-                                            solve_time.count() << " ms" << std::endl;
 
                                     result.solved = true;
                                     result.ra = ra;
