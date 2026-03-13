@@ -183,7 +183,7 @@ static void render_display(IDisplay &display, StarMapRenderer &star_map,
             // Show the central half of the camera FOV on the map
             float map_fov = result.fov * 0.5f;
             star_map.render(display, result.ra, result.dec, map_fov,
-                            0.0f, IDisplay::MAP_Y0, IDisplay::MAP_Y1);
+                            result.roll, IDisplay::MAP_Y0, IDisplay::MAP_Y1);
         }
         display.show_solve_result(result);
         break;

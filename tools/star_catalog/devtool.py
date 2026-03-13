@@ -95,6 +95,7 @@ def generate_star_field(
     center_ra_deg,
     center_dec_deg,
     fov_deg=75.0,
+    roll_deg=0.0,
     width=2028,
     height=1520,
     noise_level=8,
@@ -103,17 +104,23 @@ def generate_star_field(
     """Generate a 16-bit synthetic star field image.
 
     Uses gnomonic projection, Gaussian PSFs, and light read noise.
+    roll_deg rotates the camera around the optical axis (degrees).
     Returns a numpy uint16 array.
     """
     center_ra = np.radians(center_ra_deg)
     center_dec = np.radians(center_dec_deg)
     fov_rad = np.radians(fov_deg)
+    roll_rad = np.radians(roll_deg)
 
     # Pixels per radian
     scale = width / (2.0 * np.tan(fov_rad / 2.0))
 
     cx = width / 2.0
     cy = height / 2.0
+
+    # Precompute roll rotation
+    cos_roll = np.cos(roll_rad)
+    sin_roll = np.sin(roll_rad)
 
     # Start with background
     img = np.full((height, width), bg_level, dtype=np.float64)
@@ -136,6 +143,13 @@ def generate_star_field(
 
         x_proj = (cos_d * sin_dra) / cos_c
         y_proj = (cos_d0 * sin_d - sin_d0 * cos_d * cos_dra) / cos_c
+
+        # Apply roll rotation around optical axis
+        if roll_rad != 0.0:
+            rx = x_proj * cos_roll - y_proj * sin_roll
+            ry = x_proj * sin_roll + y_proj * cos_roll
+            x_proj = rx
+            y_proj = ry
 
         px = cx - x_proj * scale
         py = cy - y_proj * scale
@@ -377,6 +391,7 @@ class DevToolApp(App):
             yield Input(placeholder="RA (deg)", id="ra-input", value="84.05")
             yield Input(placeholder="Dec (deg)", id="dec-input", value="-1.2")
             yield Input(placeholder="FOV (deg)", id="fov-input", value="75")
+            yield Input(placeholder="Roll (deg)", id="roll-input", value="0")
             yield Button("Go", variant="primary", id="go-btn")
             yield Button("Show Image", id="show-img-btn")
             yield Button("No Solution", id="nosol-btn")
@@ -516,22 +531,23 @@ class DevToolApp(App):
             ra_deg = float(self.query_one("#ra-input", Input).value)
             dec_deg = float(self.query_one("#dec-input", Input).value)
             fov_deg = float(self.query_one("#fov-input", Input).value)
+            roll_deg = float(self.query_one("#roll-input", Input).value)
         except ValueError:
             self.set_status("Invalid coordinates")
             return
 
         sky = self.query_one("#sky", SkyPreview)
-        sky.info = f"Generating...\nRA={ra_deg:.2f} Dec={dec_deg:.2f}\nFOV={fov_deg:.1f}deg"
+        sky.info = f"Generating...\nRA={ra_deg:.2f} Dec={dec_deg:.2f}\nFOV={fov_deg:.1f}deg Roll={roll_deg:.1f}deg"
         self.set_status("Generating star field...")
-        self.call_later(lambda: self._run_solve(ra_deg, dec_deg, fov_deg))
+        self.call_later(lambda: self._run_solve(ra_deg, dec_deg, fov_deg, roll_deg))
 
-    def _run_solve(self, ra_deg, dec_deg, fov_deg):
+    def _run_solve(self, ra_deg, dec_deg, fov_deg, roll_deg=0.0):
         sky = self.query_one("#sky", SkyPreview)
 
         # Generate synthetic image
         img = generate_star_field(
             self.stars, ra_deg, dec_deg, fov_deg=fov_deg,
-            width=2028, height=1520,
+            roll_deg=roll_deg, width=2028, height=1520,
         )
         self.last_image = img
 
@@ -577,10 +593,12 @@ class DevToolApp(App):
 
         # Show result info
         if result.get("solved"):
+            roll_deg_result = result.get('roll_rad', 0) * 180.0 / np.pi
             sky.info = (
                 f"SOLVED\n"
                 f"RA:  {result['ra_deg']:.4f} deg\n"
                 f"Dec: {result['dec_deg']:.4f} deg\n"
+                f"Roll: {roll_deg_result:.2f} deg\n"
                 f"FOV: {result['fov_deg']:.2f} deg\n"
                 f"RMSE: {result.get('rmse', 0):.2f}\"\n"
                 f"Stars: {result.get('num_detected', '?')}\n"

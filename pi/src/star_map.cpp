@@ -83,12 +83,17 @@ void StarMapRenderer::render_impl(IStarMapCanvas &canvas, int w,
 
     static int star_visible_idx[STAR_MAP_NUM_STARS];
 
+    // Use a wide margin so off-screen stars are still tracked for
+    // constellation line drawing (lines are clipped during rasterisation).
+    int margin = w * 2;
+
     for (int i = 0; i < STAR_MAP_NUM_STARS; i++) {
         star_visible_idx[i] = -1;
         int px, py;
         if (project(STAR_MAP_RA[i], STAR_MAP_DEC[i], ra, dec, roll, scale,
                     cx, cy, map_h, px, py)) {
-            if (px >= -5 && px < w + 5 && py >= map_y0 - 5 && py <= map_y1 + 5) {
+            if (px >= -margin && px < w + margin &&
+                py >= map_y0 - margin && py <= map_y1 + margin) {
                 star_visible_idx[i] = num_visible;
                 visible[num_visible] = {i, px, py, STAR_MAP_MAG10[i]};
                 num_visible++;
