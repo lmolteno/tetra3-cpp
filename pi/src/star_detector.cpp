@@ -108,8 +108,10 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
 
     // Step 1: Background estimation via sigma-clipping
     auto [bg_mean, bg_stddev] = estimate_background(data, width, height);
-    std::cout << "Background: mean=" << std::fixed << std::setprecision(1) << bg_mean
-              << ", stddev=" << std::setprecision(1) << bg_stddev << std::endl;
+    if (config.verbose) {
+        std::cout << "Background: mean=" << std::fixed << std::setprecision(1) << bg_mean
+                  << ", stddev=" << std::setprecision(1) << bg_stddev << std::endl;
+    }
 
     // Step 2: Create binary mask at detection threshold
     double threshold = bg_mean + config.detection_sigma * bg_stddev;
@@ -179,18 +181,19 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
                   return a.snr > b.snr;
               });
 
-    // Log each star
-    std::cout << "Detected " << stars.size() << " stars (threshold=" << std::fixed
-              << std::setprecision(0) << threshold << ")" << std::endl;
-    for (size_t i = 0; i < stars.size(); i++) {
-        const auto &s = stars[i];
-        std::cout << "  Star " << std::setw(3) << i
-                  << ": pos=(" << std::fixed << std::setprecision(1) << s.centroid.y
-                  << ", " << std::setprecision(1) << s.centroid.x << ")"
-                  << " SNR=" << std::setprecision(1) << s.snr
-                  << " peak=" << std::setprecision(0) << s.peak_value
-                  << " flux=" << std::setprecision(0) << s.flux
-                  << " size=" << s.cluster_size << std::endl;
+    if (config.verbose) {
+        std::cout << "Detected " << stars.size() << " stars (threshold=" << std::fixed
+                  << std::setprecision(0) << threshold << ")" << std::endl;
+        for (size_t i = 0; i < stars.size(); i++) {
+            const auto &s = stars[i];
+            std::cout << "  Star " << std::setw(3) << i
+                      << ": pos=(" << std::fixed << std::setprecision(1) << s.centroid.y
+                      << ", " << std::setprecision(1) << s.centroid.x << ")"
+                      << " SNR=" << std::setprecision(1) << s.snr
+                      << " peak=" << std::setprecision(0) << s.peak_value
+                      << " flux=" << std::setprecision(0) << s.flux
+                      << " size=" << s.cluster_size << std::endl;
+        }
     }
 
     return stars;

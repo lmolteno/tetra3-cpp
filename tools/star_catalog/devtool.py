@@ -9,12 +9,16 @@ Usage:
 """
 
 import argparse
+import asyncio
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +28,9 @@ from textual.widgets import Header, Footer, Static, Input, Label, Button
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual import on
+
+from celestial import imu_to_celestial, quaternion_to_alt_az_roll
+from imu_server import IMUServer
 
 # ---------------------------------------------------------------------------
 # Hipparcos star cache
@@ -90,6 +97,35 @@ def load_hipparcos_cached(mag_limit=5.0):
 # Synthetic star field image generation
 # ---------------------------------------------------------------------------
 
+def _prepare_star_arrays(stars_dict):
+    """Convert star dict to contiguous arrays for vectorized operations.
+
+    Call once, reuse across many generate_star_field calls.
+    Returns (ra, dec, mag) arrays.
+    """
+    n = len(stars_dict)
+    ra = np.empty(n, dtype=np.float64)
+    dec = np.empty(n, dtype=np.float64)
+    mag = np.empty(n, dtype=np.float64)
+    for i, (r, d, m) in enumerate(stars_dict.values()):
+        ra[i] = r
+        dec[i] = d
+        mag[i] = m
+    return ra, dec, mag
+
+
+# Module-level cache so arrays are built once
+_star_arrays_cache = {}
+
+
+def _get_star_arrays(stars_dict):
+    """Get or create cached star arrays."""
+    key = id(stars_dict)
+    if key not in _star_arrays_cache:
+        _star_arrays_cache[key] = _prepare_star_arrays(stars_dict)
+    return _star_arrays_cache[key]
+
+
 def generate_star_field(
     stars_dict,
     center_ra_deg,
@@ -112,79 +148,77 @@ def generate_star_field(
     fov_rad = np.radians(fov_deg)
     roll_rad = np.radians(roll_deg)
 
-    # Pixels per radian
     scale = width / (2.0 * np.tan(fov_rad / 2.0))
-
     cx = width / 2.0
     cy = height / 2.0
-
-    # Precompute roll rotation
     cos_roll = np.cos(roll_rad)
     sin_roll = np.sin(roll_rad)
-
-    # Start with background
-    img = np.full((height, width), bg_level, dtype=np.float64)
-
     sin_d0 = np.sin(center_dec)
     cos_d0 = np.cos(center_dec)
 
-    for hip, (ra, dec, mag) in stars_dict.items():
-        # Quick angular distance check
-        cos_c = sin_d0 * np.sin(dec) + cos_d0 * np.cos(dec) * np.cos(ra - center_ra)
-        if cos_c <= 0.01:
-            continue
+    # Vectorized star projection
+    all_ra, all_dec, all_mag = _get_star_arrays(stars_dict)
 
-        # Gnomonic projection
-        dra = ra - center_ra
-        sin_d = np.sin(dec)
-        cos_d = np.cos(dec)
-        cos_dra = np.cos(dra)
-        sin_dra = np.sin(dra)
+    sin_d = np.sin(all_dec)
+    cos_d = np.cos(all_dec)
+    dra = all_ra - center_ra
+    cos_dra = np.cos(dra)
+    sin_dra = np.sin(dra)
 
-        x_proj = (cos_d * sin_dra) / cos_c
-        y_proj = (cos_d0 * sin_d - sin_d0 * cos_d * cos_dra) / cos_c
+    cos_c = sin_d0 * sin_d + cos_d0 * cos_d * cos_dra
+    visible = cos_c > 0.01
+    idx = np.where(visible)[0]
 
-        # Apply roll rotation around optical axis
-        if roll_rad != 0.0:
-            rx = x_proj * cos_roll - y_proj * sin_roll
-            ry = x_proj * sin_roll + y_proj * cos_roll
-            x_proj = rx
-            y_proj = ry
+    cos_c_v = cos_c[idx]
+    x_proj = (cos_d[idx] * sin_dra[idx]) / cos_c_v
+    y_proj = (cos_d0 * sin_d[idx] - sin_d0 * cos_d[idx] * cos_dra[idx]) / cos_c_v
 
-        px = cx - x_proj * scale
-        py = cy - y_proj * scale
+    if roll_rad != 0.0:
+        rx = x_proj * cos_roll - y_proj * sin_roll
+        ry = x_proj * sin_roll + y_proj * cos_roll
+        x_proj = rx
+        y_proj = ry
 
-        if px < -20 or px >= width + 20 or py < -20 or py >= height + 20:
-            continue
+    px = cx - x_proj * scale
+    py = cy - y_proj * scale
 
-        # Star brightness: flux ~ 10^(-0.4 * mag)
-        # Scale so a mag 0 star peaks at ~40000 ADU, mag 5 at ~400 ADU
-        flux = 10 ** (-0.4 * mag) * 200000
+    on_sensor = (px > -20) & (px < width + 20) & (py > -20) & (py < height + 20)
+    sel = np.where(on_sensor)[0]
+    px = px[sel]
+    py = py[sel]
+    mags = all_mag[idx[sel]]
 
-        # Gaussian PSF (sigma ~2.0 pixels for realistic seeing)
-        sigma = 2.0
-        r = int(4 * sigma)
-        x0 = max(0, int(px) - r)
-        x1 = min(width, int(px) + r + 1)
-        y0 = max(0, int(py) - r)
-        y1 = min(height, int(py) + r + 1)
+    flux = np.power(10, -0.4 * mags) * 200000
 
+    # Stamp each star with a Gaussian PSF
+    sigma = 2.0
+    r = int(4 * sigma)  # 8 pixels
+    norm = 1.0 / (2 * np.pi * sigma**2)
+    two_sigma2 = 2.0 * sigma * sigma
+
+    img = np.full((height, width), bg_level, dtype=np.float32)
+
+    for i in range(len(px)):
+        sx, sy, sf = px[i], py[i], flux[i]
+        x0 = max(0, int(sx) - r)
+        x1 = min(width, int(sx) + r + 1)
+        y0 = max(0, int(sy) - r)
+        y1 = min(height, int(sy) + r + 1)
         if x0 >= x1 or y0 >= y1:
             continue
 
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        gauss = np.exp(-((xx - px) ** 2 + (yy - py) ** 2) / (2 * sigma**2))
-        gauss *= flux / (2 * np.pi * sigma**2)
+        # Use arange instead of mgrid — avoids creating 2D index arrays
+        xs = np.arange(x0, x1, dtype=np.float32) - sx
+        ys = np.arange(y0, y1, dtype=np.float32) - sy
+        gx = np.exp(-xs * xs / two_sigma2)
+        gy = np.exp(-ys * ys / two_sigma2)
+        img[y0:y1, x0:x1] += (sf * norm) * np.outer(gy, gx)
 
-        img[y0:y1, x0:x1] += gauss
+    if noise_level > 0:
+        img += np.random.normal(0, noise_level, img.shape).astype(np.float32)
 
-    # Add light read noise only (no Poisson — keeps background clean)
-    img += np.random.normal(0, noise_level, img.shape)
-
-    # Clip and convert to uint16
-    img = np.clip(img, 0, 65535).astype(np.uint16)
-
-    return img
+    np.clip(img, 0, 65535, out=img)
+    return img.astype(np.uint16)
 
 
 def save_image_png(img, path):
@@ -372,7 +406,8 @@ class DevToolApp(App):
         ("ctrl+g", "go", "Solve"),
     ]
 
-    def __init__(self, tracker_path, solver_path, db_stars, db_patterns, fov, **kwargs):
+    def __init__(self, tracker_path, solver_path, db_stars, db_patterns, fov,
+                 imu_port=8080, **kwargs):
         super().__init__(**kwargs)
         self.tracker_path = tracker_path
         self.solver_path = solver_path
@@ -383,6 +418,20 @@ class DevToolApp(App):
         self.tracker_proc = None
         self.last_image = None  # last generated star field (numpy uint16)
         self._viewer_proc = None
+        # IMU state
+        self._imu_mode = False
+        self._imu_server = IMUServer(
+            on_orientation_update=self._on_imu_orientation,
+            on_command=self._on_phone_command,
+            port=imu_port,
+        )
+        self._imu_ra_rad = 0.0
+        self._imu_dec_rad = 0.0
+        self._imu_roll_rad = 0.0
+        self._imu_last_send = 0.0  # monotonic time of last tracker send
+        self._imu_solver_task = None
+        self._imu_last_fb_b64 = ""
+        self._imu_last_solve = None  # last solver result dict
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -399,6 +448,9 @@ class DevToolApp(App):
             yield Button("Tracking", id="mode-tracking")
             yield Button("PA Sample", id="mode-pa-sampling")
             yield Button("PA Fix", id="mode-pa-fix")
+            yield Button("IMU", id="mode-imu")
+            yield Input(placeholder="Lat", id="lat-input", value="")
+            yield Input(placeholder="Lon", id="lon-input", value="")
         with Horizontal(id="preview-row"):
             yield OledPreview(id="oled")
             yield SkyPreview(id="sky")
@@ -408,6 +460,8 @@ class DevToolApp(App):
     def on_mount(self):
         self.set_status("Loading Hipparcos catalogue...")
         self.call_later(self._load_stars)
+        # Start IMU server (always running, even if IMU mode not active yet)
+        asyncio.create_task(self._start_imu_server())
 
     def _load_stars(self):
         self.stars = load_hipparcos_cached()
@@ -620,11 +674,249 @@ class DevToolApp(App):
         resp = self._send_to_tracker(result)
         self._update_oled(resp)
 
+    # ------------------------------------------------------------------
+    # IMU mode
+    # ------------------------------------------------------------------
+
+    async def _start_imu_server(self):
+        try:
+            await self._imu_server.start()
+            self.set_status(f"IMU server: {self._imu_server.url}")
+        except Exception as e:
+            self.set_status(f"IMU server failed: {e}")
+
+    @on(Button.Pressed, "#mode-imu")
+    def do_mode_imu(self):
+        self._imu_mode = not self._imu_mode
+        btn = self.query_one("#mode-imu", Button)
+        if self._imu_mode:
+            btn.variant = "success"
+            self.set_status(f"IMU mode ON — open {self._imu_server.url} on phone")
+            # Start periodic solver
+            if self._imu_solver_task is None or self._imu_solver_task.done():
+                self._imu_solver_task = asyncio.create_task(self._imu_solver_loop())
+        else:
+            btn.variant = "default"
+            self.set_status("IMU mode OFF")
+            if self._imu_solver_task and not self._imu_solver_task.done():
+                self._imu_solver_task.cancel()
+
+    async def _on_imu_orientation(self, q, lat, lon):
+        """Called by IMUServer when phone sends orientation data."""
+        if not self._imu_mode:
+            return
+
+        # Default GPS: use phone value, then devtool input, then give up
+        if lat is None or lon is None:
+            lat, lon = self._get_fallback_location()
+            if lat is None:
+                return
+
+        try:
+            alt_deg, az_deg, roll_deg_local = quaternion_to_alt_az_roll(q)
+            ra_rad, dec_rad, roll_rad = imu_to_celestial(
+                q, lat, lon, datetime.now(timezone.utc)
+            )
+        except Exception:
+            return
+
+        self._imu_ra_rad = ra_rad
+        self._imu_dec_rad = dec_rad
+        self._imu_roll_rad = roll_rad
+        self._imu_alt_deg = alt_deg
+        self._imu_az_deg = az_deg
+
+        # Throttle tracker updates to ~10 Hz
+        now = time.monotonic()
+        if now - self._imu_last_send < 0.1:
+            return
+        self._imu_last_send = now
+
+        fov_deg = self._get_fov_deg()
+        ra_deg = math.degrees(ra_rad)
+        dec_deg = math.degrees(dec_rad)
+        roll_deg = math.degrees(roll_rad)
+
+        # Send to pi_tracker (expects fov_rad)
+        msg = {
+            "solved": True,
+            "ra_rad": ra_rad,
+            "dec_rad": dec_rad,
+            "roll_rad": roll_rad,
+            "ra_deg": ra_deg,
+            "dec_deg": dec_deg,
+            "fov_rad": math.radians(fov_deg),
+        }
+        resp = self._send_to_tracker(msg)
+        self._update_oled(resp)
+
+        # Extract framebuffer for phone broadcast
+        fb_b64 = resp.get("fb", "") if resp else ""
+        if fb_b64:
+            self._imu_last_fb_b64 = fb_b64
+
+        # Update RA/Dec inputs to reflect current pointing
+        self._update_inputs_from_imu(ra_deg, dec_deg, roll_deg)
+
+        # Broadcast to phone
+        await self._imu_server.broadcast_state(
+            fb_b64=self._imu_last_fb_b64,
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            roll_deg=roll_deg,
+            fov_deg=fov_deg,
+            alt_deg=alt_deg,
+            az_deg=az_deg,
+            solve_status=self._imu_last_solve,
+        )
+
+    def _update_inputs_from_imu(self, ra_deg, dec_deg, roll_deg):
+        """Update the input fields with current IMU-derived coordinates."""
+        try:
+            self.query_one("#ra-input", Input).value = f"{ra_deg:.2f}"
+            self.query_one("#dec-input", Input).value = f"{dec_deg:.2f}"
+            self.query_one("#roll-input", Input).value = f"{roll_deg:.1f}"
+        except Exception:
+            pass
+
+    async def _on_phone_command(self, cmd, value):
+        """Called by IMUServer when phone sends a command."""
+        if cmd == "solve":
+            self._trigger_imu_solve()
+        elif cmd == "mode":
+            mode_map = {
+                "tracking": "mode-tracking",
+                "pa_sampling": "mode-pa-sampling",
+                "pa_fix": "mode-pa-fix",
+            }
+            btn_id = mode_map.get(value)
+            if btn_id:
+                self.query_one(f"#{btn_id}", Button).press()
+        elif cmd == "fov":
+            try:
+                fov = float(value)
+                self.query_one("#fov-input", Input).value = str(fov)
+            except (ValueError, TypeError):
+                pass
+
+    def _trigger_imu_solve(self):
+        """Trigger an immediate solver run with current IMU coordinates."""
+        if not self.stars:
+            return
+        ra_deg = math.degrees(self._imu_ra_rad)
+        dec_deg = math.degrees(self._imu_dec_rad)
+        roll_deg = math.degrees(self._imu_roll_rad)
+        fov_deg = self._get_fov_deg()
+        self.call_later(lambda: self._run_imu_solve(ra_deg, dec_deg, fov_deg, roll_deg))
+
+    async def _imu_solver_loop(self):
+        """Periodic solver loop: run every ~3 seconds while IMU mode is active."""
+        while self._imu_mode:
+            await asyncio.sleep(3.0)
+            if not self._imu_mode or not self.stars:
+                continue
+            ra_deg = math.degrees(self._imu_ra_rad)
+            dec_deg = math.degrees(self._imu_dec_rad)
+            roll_deg = math.degrees(self._imu_roll_rad)
+            fov_deg = self._get_fov_deg()
+            # Run solver in thread to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self._run_imu_solve, ra_deg, dec_deg, fov_deg, roll_deg
+            )
+
+    def _run_imu_solve(self, ra_deg, dec_deg, fov_deg, roll_deg):
+        """Run the solver for IMU validation and update sky preview."""
+        sky = self.query_one("#sky", SkyPreview)
+        sky.info = (
+            f"IMU Solve...\n"
+            f"RA={ra_deg:.2f} Dec={dec_deg:.2f}\n"
+            f"Roll={roll_deg:.1f} FOV={fov_deg:.1f}"
+        )
+
+        img = generate_star_field(
+            self.stars, ra_deg, dec_deg, fov_deg=fov_deg,
+            roll_deg=roll_deg, width=2028, height=1520,
+        )
+        self.last_image = img
+
+        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
+            tmp_path = f.name
+            header = f"P5\n{img.shape[1]} {img.shape[0]}\n65535\n".encode()
+            f.write(header)
+            f.write(img.astype(">u2").tobytes())
+
+        try:
+            cmd = [
+                self.solver_path,
+                "--db-stars", self.db_stars,
+                "--db-patterns", self.db_patterns,
+                "--fov", str(self.fov),
+                tmp_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            lines = [l for l in proc.stdout.strip().splitlines() if l.strip()]
+            json_line = lines[-1] if lines else ""
+            result = json.loads(json_line) if json_line else {"solved": False}
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+            sky.info = f"IMU solve error:\n{e}"
+            return
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        self._imu_last_solve = result
+
+        if result.get("solved"):
+            solver_ra = result["ra_deg"]
+            solver_dec = result["dec_deg"]
+            delta_ra = solver_ra - ra_deg
+            delta_dec = solver_dec - dec_deg
+            sky.info = (
+                f"IMU vs Solver\n"
+                f"IMU:    RA={ra_deg:.2f} Dec={dec_deg:.2f}\n"
+                f"Solver: RA={solver_ra:.2f} Dec={solver_dec:.2f}\n"
+                f"Delta:  dRA={delta_ra:+.2f} dDec={delta_dec:+.2f}\n"
+                f"RMSE: {result.get('rmse', 0):.2f}\"\n"
+                f"Time: {result.get('solve_time_ms', 0):.0f}ms"
+            )
+            # Send corrected result to tracker
+            resp = self._send_to_tracker(result)
+            self._update_oled(resp)
+        else:
+            sky.info = (
+                f"IMU: RA={ra_deg:.2f} Dec={dec_deg:.2f}\n"
+                f"Solver: NO SOLUTION\n"
+                f"Stars: {result.get('num_detected', 0)}\n"
+                f"Time: {result.get('solve_time_ms', 0):.0f}ms"
+            )
+
+    def _get_fov_deg(self):
+        """Get current FOV from input field."""
+        try:
+            return float(self.query_one("#fov-input", Input).value)
+        except (ValueError, Exception):
+            return 75.0
+
+    def _get_fallback_location(self):
+        """Get lat/lon from the devtool input fields, or None."""
+        try:
+            lat = float(self.query_one("#lat-input", Input).value)
+            lon = float(self.query_one("#lon-input", Input).value)
+            return lat, lon
+        except (ValueError, Exception):
+            return None, None
+
     def on_unmount(self):
         if self.tracker_proc and self.tracker_proc.poll() is None:
             self.tracker_proc.terminate()
         if self._viewer_proc and self._viewer_proc.poll() is None:
             self._viewer_proc.terminate()
+        if self._imu_solver_task and not self._imu_solver_task.done():
+            self._imu_solver_task.cancel()
+        asyncio.create_task(self._imu_server.stop())
 
 
 def main():
@@ -653,6 +945,7 @@ def main():
         help="Pattern database path",
     )
     parser.add_argument("--fov", type=float, default=75.0, help="FOV estimate for solver (deg)")
+    parser.add_argument("--imu-port", type=int, default=8080, help="IMU server port")
     args = parser.parse_args()
 
     app = DevToolApp(
@@ -661,6 +954,7 @@ def main():
         db_stars=args.db_stars,
         db_patterns=args.db_patterns,
         fov=args.fov,
+        imu_port=args.imu_port,
     )
     app.run()
 

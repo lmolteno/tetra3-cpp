@@ -18,6 +18,7 @@ struct StarDetectorConfig {
     int min_cluster_size = 3;
     int max_cluster_size = 500;
     int max_stars = 200;
+    bool verbose = false;
 };
 
 class StarDetector {

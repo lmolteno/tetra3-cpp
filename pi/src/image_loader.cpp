@@ -4,7 +4,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-ImageFileSource::ImageFileSource(const std::string &path) : file_path(path) {}
+ImageFileSource::ImageFileSource(const std::string &path, bool verbose)
+    : file_path(path), verbose(verbose) {}
 
 bool ImageFileSource::initialize() {
     cv::Mat img = cv::imread(file_path, cv::IMREAD_UNCHANGED | cv::IMREAD_ANYDEPTH);
@@ -50,8 +51,10 @@ bool ImageFileSource::initialize() {
     }
 
     loaded = true;
-    std::cout << "Loaded image: " << file_path << " (" << frame.width << "x" << frame.height
-              << ", " << frame.bit_depth << "-bit)" << std::endl;
+    if (verbose) {
+        std::cout << "Loaded image: " << file_path << " (" << frame.width << "x" << frame.height
+                  << ", " << frame.bit_depth << "-bit)" << std::endl;
+    }
     return true;
 }
 
