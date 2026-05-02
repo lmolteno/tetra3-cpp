@@ -18,6 +18,7 @@ struct StarDetectorConfig {
     int min_cluster_size = 3;
     int max_cluster_size = 500;
     int max_stars = 200;
+    int bg_tile_size = 64;   // tile size for local background estimation
     bool verbose = false;
 };
 
@@ -35,6 +36,21 @@ private:
     };
 
     BackgroundStats estimate_background(const uint16_t *data, int width, int height);
+
+    struct TiledBackground {
+        std::vector<float> tile_mean;
+        std::vector<float> tile_std;
+        int tiles_x, tile_size;
+
+        float mean_at(int y, int x) const {
+            return tile_mean[(y / tile_size) * tiles_x + x / tile_size];
+        }
+        float std_at(int y, int x) const {
+            return tile_std[(y / tile_size) * tiles_x + x / tile_size];
+        }
+    };
+
+    TiledBackground compute_local_background(const uint16_t *data, int width, int height);
 
     struct Point { int y, x; };
 

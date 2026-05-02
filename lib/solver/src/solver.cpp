@@ -437,10 +437,11 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     int max_stars_to_check = std::min(num_extracted_stars_raw, pattern_checking_stars);
 
     // Pre-compute star vectors for pattern-checking stars (avoids redundant work per combo)
+    // Use undistorted centroids so distortion correction actually affects pattern matching
     std::vector<std::array<double, 3>> precomputed_vectors;
     {
-        std::vector<Centroid> check_centroids(centroids.begin(),
-                                               centroids.begin() + max_stars_to_check);
+        std::vector<Centroid> check_centroids(image_centroids_undist.begin(),
+                                               image_centroids_undist.begin() + max_stars_to_check);
         precomputed_vectors = compute_vectors(check_centroids, height, width, fov);
     }
 
@@ -552,7 +553,8 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                 }
 
                                 std::vector<Centroid> pattern_centroids = {
-                                    centroids[i], centroids[j], centroids[k], centroids[l]
+                                    image_centroids_undist[i], image_centroids_undist[j],
+                                    image_centroids_undist[k], image_centroids_undist[l]
                                 };
                                 auto pattern_vectors = compute_vectors(pattern_centroids, height, width, fov);
 

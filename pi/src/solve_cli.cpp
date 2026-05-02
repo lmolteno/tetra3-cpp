@@ -21,7 +21,7 @@
 static void solve_image(const std::string &image_path,
                         SimpleStarSolver &solver,
                         float fov, float detection_sigma, int crop_size,
-                        bool debug) {
+                        int bg_tile_size, bool debug) {
     ImageFileSource source(image_path, debug);
     if (!source.initialize()) {
         printf("{\"solved\":false,\"error\":\"image_load_failed\"}\n");
@@ -40,6 +40,7 @@ static void solve_image(const std::string &image_path,
 
     StarDetectorConfig det_cfg;
     det_cfg.detection_sigma = detection_sigma;
+    det_cfg.bg_tile_size = bg_tile_size;
     det_cfg.verbose = debug;
     StarDetector detector(det_cfg);
     auto detected = detector.detect(frame);
@@ -138,6 +139,7 @@ int main(int argc, char *argv[]) {
     float fov = 11.0f;
     float detection_sigma = 5.0f;
     int crop_size = 720;
+    int bg_tile_size = 128;
     bool batch_mode = false;
     bool debug = false;
 
@@ -153,6 +155,8 @@ int main(int argc, char *argv[]) {
             detection_sigma = std::stof(argv[++i]);
         } else if (arg == "--crop" && i + 1 < argc) {
             crop_size = std::stoi(argv[++i]);
+        } else if (arg == "--bg-tile" && i + 1 < argc) {
+            bg_tile_size = std::stoi(argv[++i]);
         } else if (arg == "--batch") {
             batch_mode = true;
         } else if (arg == "--debug") {
@@ -186,10 +190,10 @@ int main(int argc, char *argv[]) {
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
                 line.pop_back();
             if (line.empty()) continue;
-            solve_image(line, solver, fov, detection_sigma, crop_size, debug);
+            solve_image(line, solver, fov, detection_sigma, crop_size, bg_tile_size, debug);
         }
     } else {
-        solve_image(image_path, solver, fov, detection_sigma, crop_size, debug);
+        solve_image(image_path, solver, fov, detection_sigma, crop_size, bg_tile_size, debug);
     }
 
     return 0;

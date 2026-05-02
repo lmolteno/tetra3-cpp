@@ -101,24 +101,111 @@ int StarDetector::flood_fill(const std::vector<uint8_t> &mask, int width, int he
     return count;
 }
 
+StarDetector::TiledBackground StarDetector::compute_local_background(
+        const uint16_t *data, int width, int height) {
+    int tile = config.bg_tile_size;
+    int tiles_x = (width + tile - 1) / tile;
+    int tiles_y = (height + tile - 1) / tile;
+
+    TiledBackground bg;
+    bg.tiles_x = tiles_x;
+    bg.tile_size = tile;
+    bg.tile_mean.resize(tiles_x * tiles_y);
+    bg.tile_std.resize(tiles_x * tiles_y);
+    std::vector<double> samples;
+
+    for (int ty = 0; ty < tiles_y; ty++) {
+        for (int tx = 0; tx < tiles_x; tx++) {
+            int y0 = ty * tile, y1 = std::min(y0 + tile, height);
+            int x0 = tx * tile, x1 = std::min(x0 + tile, width);
+
+            samples.clear();
+            for (int y = y0; y < y1; y += 2)
+                for (int x = x0; x < x1; x += 2)
+                    samples.push_back(data[y * width + x]);
+
+            double mean = 0, stddev = 0;
+            for (int iter = 0; iter < config.sigma_clip_iterations && !samples.empty(); iter++) {
+                double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+                mean = sum / samples.size();
+                double sq_sum = 0;
+                for (double v : samples) { double d = v - mean; sq_sum += d * d; }
+                stddev = std::sqrt(sq_sum / samples.size());
+                if (stddev < 1e-6) break;
+
+                double lo = mean - config.sigma_clip_factor * stddev;
+                double hi = mean + config.sigma_clip_factor * stddev;
+                std::erase_if(samples, [lo, hi](double v) { return v < lo || v > hi; });
+            }
+            if (!samples.empty()) {
+                double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+                mean = sum / samples.size();
+                double sq_sum = 0;
+                for (double v : samples) { double d = v - mean; sq_sum += d * d; }
+                stddev = std::sqrt(sq_sum / samples.size());
+            }
+
+            bg.tile_mean[ty * tiles_x + tx] = static_cast<float>(mean);
+            bg.tile_std[ty * tiles_x + tx] = static_cast<float>(stddev);
+        }
+    }
+
+    return bg;
+}
+
 std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
     const uint16_t *data = frame.data.data();
     int width = frame.width;
     int height = frame.height;
 
-    // Step 1: Background estimation via sigma-clipping
-    auto [bg_mean, bg_stddev] = estimate_background(data, width, height);
+    // Step 1: Local background estimation (tile grid only, no per-pixel map)
+    auto bg = compute_local_background(data, width, height);
+
     if (config.verbose) {
+        auto [bg_mean, bg_stddev] = estimate_background(data, width, height);
         std::cout << "Background: mean=" << std::fixed << std::setprecision(1) << bg_mean
                   << ", stddev=" << std::setprecision(1) << bg_stddev << std::endl;
     }
 
-    // Step 2: Create binary mask at detection threshold
-    double threshold = bg_mean + config.detection_sigma * bg_stddev;
+    // Step 2: Create binary mask using local threshold
+    // Precompute per-tile threshold, then bilinearly interpolate per pixel
+    int tile = bg.tile_size;
+    int ntiles = static_cast<int>(bg.tile_mean.size());
+    int tiles_x = bg.tiles_x;
+    int tiles_y = ntiles / tiles_x;
+    float half = tile * 0.5f;
+
+    std::vector<float> tile_thresh(ntiles);
+    for (int i = 0; i < ntiles; i++)
+        tile_thresh[i] = bg.tile_mean[i] + config.detection_sigma * bg.tile_std[i];
+
     std::vector<uint8_t> mask(width * height, 0);
-    for (int i = 0; i < width * height; i++) {
-        if (data[i] > threshold) {
-            mask[i] = 1;
+    for (int y = 0; y < height; y++) {
+        // Tile-center relative coordinate and row indices
+        float fy_raw = (static_cast<float>(y) - half) / tile;
+        int ty0 = std::max(0, static_cast<int>(fy_raw));
+        int ty1 = std::min(tiles_y - 1, ty0 + 1);
+        float fy = fy_raw - ty0;
+        if (fy < 0.0f) fy = 0.0f;
+        int row0 = ty0 * tiles_x;
+        int row1 = ty1 * tiles_x;
+        float w0y = 1.0f - fy, w1y = fy;
+
+        for (int x = 0; x < width; x++) {
+            float fx_raw = (static_cast<float>(x) - half) / tile;
+            int tx0 = std::max(0, static_cast<int>(fx_raw));
+            int tx1 = std::min(tiles_x - 1, tx0 + 1);
+            float fx = fx_raw - tx0;
+            if (fx < 0.0f) fx = 0.0f;
+
+            float thresh = tile_thresh[row0 + tx0] * (1.0f - fx) * w0y
+                         + tile_thresh[row0 + tx1] * fx * w0y
+                         + tile_thresh[row1 + tx0] * (1.0f - fx) * w1y
+                         + tile_thresh[row1 + tx1] * fx * w1y;
+
+            if (data[y * width + x] > thresh) {
+                mask[y * width + x] = 1;
+            }
         }
     }
 
@@ -137,18 +224,35 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
                     continue;
                 }
 
-                // Step 4: Intensity-weighted centroid
+                // Reject elongated clusters (edges/structure) via bounding box aspect ratio
+                int min_y = height, max_y = 0, min_x = width, max_x = 0;
+                for (const auto &pt : cluster_points) {
+                    if (pt.y < min_y) min_y = pt.y;
+                    if (pt.y > max_y) max_y = pt.y;
+                    if (pt.x < min_x) min_x = pt.x;
+                    if (pt.x > max_x) max_x = pt.x;
+                }
+                int bbox_w = max_x - min_x + 1;
+                int bbox_h = max_y - min_y + 1;
+                float aspect = static_cast<float>(std::max(bbox_w, bbox_h)) /
+                               std::max(1, std::min(bbox_w, bbox_h));
+                if (aspect > 3.0f) continue;  // stars are roughly circular
+
+                // Step 4: Intensity-weighted centroid using local background
                 double sum_iy = 0, sum_ix = 0, sum_i = 0;
                 double peak = 0;
+                double local_bg_std_sum = 0;
 
                 for (const auto &pt : cluster_points) {
-                    double intensity = static_cast<double>(data[pt.y * width + pt.x]) - bg_mean;
+                    int pidx = pt.y * width + pt.x;
+                    double intensity = static_cast<double>(data[pidx]) - bg.mean_at(pt.y, pt.x);
                     if (intensity < 0) intensity = 0;
                     sum_iy += pt.y * intensity;
                     sum_ix += pt.x * intensity;
                     sum_i += intensity;
-                    if (data[pt.y * width + pt.x] > peak) {
-                        peak = data[pt.y * width + pt.x];
+                    local_bg_std_sum += bg.std_at(pt.y, pt.x);
+                    if (data[pidx] > peak) {
+                        peak = data[pidx];
                     }
                 }
 
@@ -157,11 +261,11 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
                 double cy = sum_iy / sum_i;
                 double cx = sum_ix / sum_i;
 
-                // Step 5: SNR calculation (Poisson + read noise model)
-                // SNR = total_flux / sqrt(total_flux + n_pixels * sigma_bg^2)
+                // Step 5: SNR using local background stddev
                 double total_flux = sum_i;
                 int n_pixels = static_cast<int>(cluster_points.size());
-                double noise = std::sqrt(total_flux + n_pixels * bg_stddev * bg_stddev);
+                double avg_bg_std = local_bg_std_sum / n_pixels;
+                double noise = std::sqrt(total_flux + n_pixels * avg_bg_std * avg_bg_std);
                 double snr = (noise > 0) ? total_flux / noise : 0;
 
                 DetectedStar star;
@@ -182,8 +286,8 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
               });
 
     if (config.verbose) {
-        std::cout << "Detected " << stars.size() << " stars (threshold=" << std::fixed
-                  << std::setprecision(0) << threshold << ")" << std::endl;
+        std::cout << "Detected " << stars.size() << " stars (local background, "
+                  << config.detection_sigma << " sigma)" << std::endl;
         for (size_t i = 0; i < stars.size(); i++) {
             const auto &s = stars[i];
             std::cout << "  Star " << std::setw(3) << i
