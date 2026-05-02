@@ -95,6 +95,9 @@ void publish(std::ostream &out, const State &s) {
             emit("archive",    t.archive);
             emit("load",       t.load);
             emit("detect",     t.detect);
+            emit("bg",         t.bg);
+            emit("mask",       t.mask);
+            emit("cluster",    t.cluster);
             emit("match",      t.match);
             emit("solve_wall", t.solve_wall);
             emit("result_age", t.result_age);

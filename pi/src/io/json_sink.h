@@ -25,6 +25,9 @@ struct Timing {
     float archive     = -1.0f;
     float load        = -1.0f;
     float detect      = -1.0f;
+    float bg          = -1.0f;   // detect sub-stage: tiled BG estimation
+    float mask        = -1.0f;   // detect sub-stage: bilinear threshold mask
+    float cluster     = -1.0f;   // detect sub-stage: flood fill + centroiding
     float match       = -1.0f;
     float solve_wall  = -1.0f;
     float result_age  = -1.0f;

@@ -53,12 +53,17 @@ static void solve_image(const std::string &image_path,
     StarDetector detector(det_cfg);
 
     auto t_detect = clock::now();
-    auto detected = detector.detect(frame);
+    StarDetectorStats det_stats_full;
+    auto detected = detector.detect(frame, &det_stats_full);
     double detect_ms = ms_since(t_detect);
+    StarDetectorStats det_stats_crop;
 
     if (detected.empty()) {
         printf("{\"solved\":false,\"error\":\"no_stars\",\"num_detected\":0,"
-               "\"load_ms\":%.1f,\"detect_ms\":%.1f}\n", load_ms, detect_ms);
+               "\"load_ms\":%.1f,\"detect_ms\":%.1f,"
+               "\"bg_ms\":%.1f,\"mask_ms\":%.1f,\"cluster_ms\":%.1f}\n",
+               load_ms, detect_ms,
+               det_stats_full.bg_ms, det_stats_full.mask_ms, det_stats_full.cluster_ms);
         fflush(stdout);
         return;
     }
@@ -89,7 +94,7 @@ static void solve_image(const std::string &image_path,
     SolveResult result = {false, 0, 0, 0, 0, 0, 0, 0, 0.0f};
 
     auto t_crop_detect = clock::now();
-    auto crop_detected = detector.detect(crop_frame);
+    auto crop_detected = detector.detect(crop_frame, &det_stats_crop);
     detect_ms += ms_since(t_crop_detect);
     if (crop_detected.size() >= 4) {
         std::vector<Centroid> crop_centroids;
@@ -124,6 +129,12 @@ static void solve_image(const std::string &image_path,
             0.01f, 0.001f, std::nullopt, fov * 0.2f);
     }
 
+    // Sum detector sub-stages across the full + crop passes so the breakdown
+    // covers the same wall clock that detect_ms measures.
+    double bg_ms      = det_stats_full.bg_ms      + det_stats_crop.bg_ms;
+    double mask_ms    = det_stats_full.mask_ms    + det_stats_crop.mask_ms;
+    double cluster_ms = det_stats_full.cluster_ms + det_stats_crop.cluster_ms;
+
     // Output JSON. solve_time_ms is the matcher's internal time (just pattern
     // search); load_ms / detect_ms cover the rest of solve_cli's wall clock.
     if (result.solved) {
@@ -132,12 +143,14 @@ static void solve_image(const std::string &image_path,
                "\"fov_rad\":%.8f,\"rmse\":%.4f,"
                "\"num_matches\":%d,\"solve_time_ms\":%.1f,"
                "\"load_ms\":%.1f,\"detect_ms\":%.1f,"
+               "\"bg_ms\":%.1f,\"mask_ms\":%.1f,\"cluster_ms\":%.1f,"
                "\"num_detected\":%d,"
                "\"ra_deg\":%.6f,\"dec_deg\":%.6f,\"fov_deg\":%.6f}\n",
                result.ra, result.dec, result.roll,
                result.fov, result.rmse,
                result.num_matches, result.solve_time_ms,
                load_ms, detect_ms,
+               bg_ms, mask_ms, cluster_ms,
                num_detected_full,
                result.ra * 180.0 / M_PI,
                result.dec * 180.0 / M_PI,
@@ -145,8 +158,10 @@ static void solve_image(const std::string &image_path,
     } else {
         printf("{\"solved\":false,\"solve_time_ms\":%.1f,"
                "\"load_ms\":%.1f,\"detect_ms\":%.1f,"
+               "\"bg_ms\":%.1f,\"mask_ms\":%.1f,\"cluster_ms\":%.1f,"
                "\"num_detected\":%d}\n",
-               result.solve_time_ms, load_ms, detect_ms, num_detected_full);
+               result.solve_time_ms, load_ms, detect_ms,
+               bg_ms, mask_ms, cluster_ms, num_detected_full);
     }
     fflush(stdout);
 }

@@ -285,6 +285,9 @@ int main(int argc, char *argv[]) {
                 last_solve_timing = json_sink::Timing{};
                 last_solve_timing.load       = rs->load_ms;
                 last_solve_timing.detect     = rs->detect_ms;
+                last_solve_timing.bg         = rs->bg_ms;
+                last_solve_timing.mask       = rs->mask_ms;
+                last_solve_timing.cluster    = rs->cluster_ms;
                 last_solve_timing.match      = last_result.solve_time_ms;
                 last_solve_timing.solve_wall = rs->wall_ms;
                 last_result_at = rs->received_at;

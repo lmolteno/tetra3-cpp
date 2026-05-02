@@ -1,5 +1,6 @@
 #include "solver/star_detector.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <iomanip>
@@ -153,13 +154,21 @@ StarDetector::TiledBackground StarDetector::compute_local_background(
     return bg;
 }
 
-std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
+std::vector<DetectedStar> StarDetector::detect(const Frame &frame,
+                                                StarDetectorStats *stats) {
     const uint16_t *data = frame.data.data();
     int width = frame.width;
     int height = frame.height;
 
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(clock::now() - t).count();
+    };
+
     // Step 1: Local background estimation (tile grid only, no per-pixel map)
+    auto t_bg = clock::now();
     auto bg = compute_local_background(data, width, height);
+    double bg_ms = ms_since(t_bg);
 
     if (config.verbose) {
         auto [bg_mean, bg_stddev] = estimate_background(data, width, height);
@@ -169,6 +178,7 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
 
     // Step 2: Create binary mask using local threshold
     // Precompute per-tile threshold, then bilinearly interpolate per pixel
+    auto t_mask = clock::now();
     int tile = bg.tile_size;
     int ntiles = static_cast<int>(bg.tile_mean.size());
     int tiles_x = bg.tiles_x;
@@ -209,7 +219,10 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
         }
     }
 
+    double mask_ms = ms_since(t_mask);
+
     // Step 3: Flood fill to find clusters
+    auto t_cluster = clock::now();
     std::vector<uint8_t> visited(width * height, 0);
     std::vector<DetectedStar> stars;
     std::vector<Point> cluster_points;
@@ -284,6 +297,13 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame) {
               [](const DetectedStar &a, const DetectedStar &b) {
                   return a.snr > b.snr;
               });
+    double cluster_ms = ms_since(t_cluster);
+
+    if (stats) {
+        stats->bg_ms      = bg_ms;
+        stats->mask_ms    = mask_ms;
+        stats->cluster_ms = cluster_ms;
+    }
 
     if (config.verbose) {
         std::cout << "Detected " << stars.size() << " stars (local background, "

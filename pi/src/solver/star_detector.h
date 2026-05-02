@@ -22,11 +22,19 @@ struct StarDetectorConfig {
     bool verbose = false;
 };
 
+// Per-call stage breakdown. Filled in by detect() when out is non-null.
+struct StarDetectorStats {
+    double bg_ms = 0;       // tiled sigma-clipped background estimation
+    double mask_ms = 0;     // bilinear-interpolated threshold mask
+    double cluster_ms = 0;  // flood fill + centroiding + SNR
+};
+
 class StarDetector {
 public:
     explicit StarDetector(const StarDetectorConfig &config = {});
 
-    std::vector<DetectedStar> detect(const Frame &frame);
+    std::vector<DetectedStar> detect(const Frame &frame,
+                                     StarDetectorStats *stats = nullptr);
 
 private:
     StarDetectorConfig config;

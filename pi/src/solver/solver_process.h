@@ -34,6 +34,9 @@ public:
         // Stages reported by solve_cli (-1 = absent in this result).
         float load_ms = -1.0f;
         float detect_ms = -1.0f;
+        float bg_ms = -1.0f;
+        float mask_ms = -1.0f;
+        float cluster_ms = -1.0f;
         // Wall-clock interval between submit and result-arrived in pi_tracker.
         // Includes IPC + everything solve_cli did.
         float wall_ms = 0.0f;
@@ -85,6 +88,9 @@ private:
         SolveResult result{};
         float load_ms = -1.0f;
         float detect_ms = -1.0f;
+        float bg_ms = -1.0f;
+        float mask_ms = -1.0f;
+        float cluster_ms = -1.0f;
     };
     static ParsedResult parse_result(const std::string &json);
 };

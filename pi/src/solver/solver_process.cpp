@@ -167,6 +167,9 @@ void SolverProcess::reader_loop() {
             rs.seq         = next_seq_++;
             rs.load_ms     = parsed.load_ms;
             rs.detect_ms   = parsed.detect_ms;
+            rs.bg_ms       = parsed.bg_ms;
+            rs.mask_ms     = parsed.mask_ms;
+            rs.cluster_ms  = parsed.cluster_ms;
             rs.received_at = now;
             rs.wall_ms     = std::chrono::duration<float, std::milli>(
                                  now - pending_submitted_at_).count();
@@ -191,8 +194,11 @@ SolverProcess::ParsedResult SolverProcess::parse_result(const std::string &json)
         p.result.num_matches   = static_cast<int>(json_float(json, "num_matches"));
     }
     p.result.solve_time_ms = static_cast<float>(json_float(json, "solve_time_ms"));
-    p.load_ms   = static_cast<float>(json_float(json, "load_ms",   -1.0));
-    p.detect_ms = static_cast<float>(json_float(json, "detect_ms", -1.0));
+    p.load_ms    = static_cast<float>(json_float(json, "load_ms",    -1.0));
+    p.detect_ms  = static_cast<float>(json_float(json, "detect_ms",  -1.0));
+    p.bg_ms      = static_cast<float>(json_float(json, "bg_ms",      -1.0));
+    p.mask_ms    = static_cast<float>(json_float(json, "mask_ms",    -1.0));
+    p.cluster_ms = static_cast<float>(json_float(json, "cluster_ms", -1.0));
     return p;
 }
 
