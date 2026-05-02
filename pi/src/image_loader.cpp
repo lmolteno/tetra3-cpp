@@ -1,64 +1,166 @@
 #include "image_loader.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
-#include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
+#include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNM
+#define STBI_ONLY_TGA
+#define STBI_ONLY_BMP
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#include <stb_image.h>
 
 ImageFileSource::ImageFileSource(const std::string &path, bool verbose)
     : file_path(path), verbose(verbose) {}
 
-bool ImageFileSource::initialize() {
-    cv::Mat img = cv::imread(file_path, cv::IMREAD_UNCHANGED | cv::IMREAD_ANYDEPTH);
-    if (img.empty()) {
-        std::cerr << "Failed to load image: " << file_path << std::endl;
+namespace {
+
+// stb_image's PNM loader only handles 8-bit PGM. We see 16-bit PGM frequently
+// (synthetic images, raw dumps), so we have a small parser of our own.
+bool load_pgm_16(const std::string &path, std::vector<uint16_t> &out,
+                 int &w, int &h, int &bit_depth) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    auto skip_ws = [&]() {
+        for (;;) {
+            int c = std::fgetc(f);
+            if (c == EOF) return;
+            if (c == '#') {
+                while (c != '\n' && c != EOF) c = std::fgetc(f);
+                continue;
+            }
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            std::ungetc(c, f);
+            return;
+        }
+    };
+    auto read_int = [&]() -> int {
+        skip_ws();
+        int v = 0;
+        bool any = false;
+        for (;;) {
+            int c = std::fgetc(f);
+            if (c < '0' || c > '9') {
+                if (c != EOF) std::ungetc(c, f);
+                break;
+            }
+            v = v * 10 + (c - '0');
+            any = true;
+        }
+        return any ? v : -1;
+    };
+
+    char magic[2];
+    if (std::fread(magic, 1, 2, f) != 2 || magic[0] != 'P' || magic[1] != '5') {
+        std::fclose(f);
         return false;
     }
+    int width = read_int();
+    int height = read_int();
+    int maxval = read_int();
+    if (width <= 0 || height <= 0 || maxval <= 0) {
+        std::fclose(f);
+        return false;
+    }
+    // Single whitespace byte after maxval, per spec.
+    std::fgetc(f);
 
-    // Convert to grayscale if needed
-    cv::Mat gray;
-    if (img.channels() > 1) {
-        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    out.resize(static_cast<size_t>(width) * height);
+    if (maxval <= 255) {
+        std::vector<uint8_t> tmp(out.size());
+        if (std::fread(tmp.data(), 1, tmp.size(), f) != tmp.size()) {
+            std::fclose(f);
+            return false;
+        }
+        for (size_t i = 0; i < tmp.size(); i++) {
+            out[i] = static_cast<uint16_t>(tmp[i]) * 257;  // expand to full 16-bit
+        }
+        bit_depth = 8;
     } else {
-        gray = img;
+        // 16-bit big-endian per PGM spec.
+        std::vector<uint8_t> tmp(out.size() * 2);
+        if (std::fread(tmp.data(), 1, tmp.size(), f) != tmp.size()) {
+            std::fclose(f);
+            return false;
+        }
+        for (size_t i = 0; i < out.size(); i++) {
+            out[i] = (static_cast<uint16_t>(tmp[2*i]) << 8) | tmp[2*i + 1];
+        }
+        bit_depth = 16;
+    }
+    w = width;
+    h = height;
+    std::fclose(f);
+    return true;
+}
+
+}
+
+bool ImageFileSource::initialize() {
+    // Try our PGM-16 fast path first (covers the common synthetic / raw-dump
+    // case).
+    int w = 0, h = 0, bit_depth = 0;
+    std::vector<uint16_t> pgm;
+    if (load_pgm_16(file_path, pgm, w, h, bit_depth)) {
+        frame.width = w;
+        frame.height = h;
+        frame.bit_depth = bit_depth;
+        frame.data = std::move(pgm);
+        loaded = true;
+        if (verbose) {
+            std::cout << "Loaded image: " << file_path << " (" << w << "x" << h
+                      << ", " << bit_depth << "-bit PGM)" << std::endl;
+        }
+        return true;
     }
 
-    // Determine bit depth and convert to 16-bit
-    cv::Mat gray16;
-    if (gray.depth() == CV_16U) {
-        gray16 = gray;
-        frame.bit_depth = 16;
-    } else if (gray.depth() == CV_8U) {
-        gray.convertTo(gray16, CV_16U, 257.0); // scale 0-255 to 0-65535
-        frame.bit_depth = 8;
-    } else if (gray.depth() == CV_32F || gray.depth() == CV_64F) {
-        double minVal, maxVal;
-        cv::minMaxLoc(gray, &minVal, &maxVal);
-        gray.convertTo(gray16, CV_16U, 65535.0 / maxVal);
-        frame.bit_depth = 16;
+    // Fall back to stb_image: 16-bit-aware load for PNG, otherwise 8-bit. We
+    // force a single grayscale channel; stb does the colour conversion.
+    int channels = 0;
+    if (stbi_is_16_bit(file_path.c_str())) {
+        stbi_us *px = stbi_load_16(file_path.c_str(), &w, &h, &channels, 1);
+        if (!px) {
+            std::cerr << "Failed to load image: " << file_path
+                      << " (" << stbi_failure_reason() << ")" << std::endl;
+            return false;
+        }
+        frame.data.assign(px, px + static_cast<size_t>(w) * h);
+        stbi_image_free(px);
+        bit_depth = 16;
     } else {
-        gray.convertTo(gray16, CV_16U);
-        frame.bit_depth = 16;
+        stbi_uc *px = stbi_load(file_path.c_str(), &w, &h, &channels, 1);
+        if (!px) {
+            std::cerr << "Failed to load image: " << file_path
+                      << " (" << stbi_failure_reason() << ")" << std::endl;
+            return false;
+        }
+        frame.data.resize(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < frame.data.size(); i++) {
+            frame.data[i] = static_cast<uint16_t>(px[i]) * 257;  // 8-bit -> 16-bit
+        }
+        stbi_image_free(px);
+        bit_depth = 8;
     }
 
-    frame.width = gray16.cols;
-    frame.height = gray16.rows;
-    frame.data.resize(frame.width * frame.height);
-
-    // Copy to contiguous buffer
-    for (int y = 0; y < frame.height; y++) {
-        const uint16_t *row = gray16.ptr<uint16_t>(y);
-        std::copy(row, row + frame.width, frame.data.data() + y * frame.width);
-    }
-
+    frame.width = w;
+    frame.height = h;
+    frame.bit_depth = bit_depth;
     loaded = true;
     if (verbose) {
-        std::cout << "Loaded image: " << file_path << " (" << frame.width << "x" << frame.height
-                  << ", " << frame.bit_depth << "-bit)" << std::endl;
+        std::cout << "Loaded image: " << file_path << " (" << w << "x" << h
+                  << ", " << bit_depth << "-bit)" << std::endl;
     }
     return true;
 }
 
 std::optional<Frame> ImageFileSource::capture() {
     if (!loaded) return std::nullopt;
-    return frame; // Return the same frame each time
+    return frame;
 }

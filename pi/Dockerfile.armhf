@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+# Cross-build pi_tracker + solve_cli for Raspberry Pi 2 Model B (ARMv7, 32-bit).
+#
+# Alpine-based build. Tracks alpine:edge so the libcamera SOVERSION lines up
+# with what current Alpine-on-Pi ships (libcamera 0.7.x at time of writing).
+# Pin to a stable Alpine release if you want a less mobile build target.
+#
+# Build (from repo root):
+#   docker build -f pi/Dockerfile.armhf -t pi_tracker_armhf .
+#
+# Extract binaries:
+#   id=$(docker create pi_tracker_armhf)
+#   mkdir -p build-armhf
+#   docker cp $id:/out/pi_tracker build-armhf/
+#   docker cp $id:/out/solve_cli  build-armhf/
+#   docker rm $id
+#
+# solve_cli is fully statically linked — single-file deploy, no runtime deps.
+# pi_tracker static-links the C/C++ runtimes and zlib but keeps libcamera
+# dynamic (libcamera dlopens IPA modules so it can't be statically linked).
+# Deploy target: any musl libc system. On the Pi:
+#   apk add libcamera libcamera-raspberrypi
+
+FROM --platform=linux/arm/v7 arm32v7/alpine:edge AS builder
+
+RUN apk add --no-cache \
+        build-base \
+        cmake \
+        pkgconfig \
+        stb \
+        eigen-dev \
+        zlib-dev \
+        zlib-static \
+        libcamera-dev
+
+WORKDIR /src
+COPY . .
+
+# Cache mount on the build dir: cmake state and object files persist across
+# `docker build` runs, so changing one source file rebuilds in seconds rather
+# than redoing the whole tree. Cache is keyed by `id` so a different project
+# won't collide. Binaries are then stashed in /out (a normal layer) so the
+# final stage can COPY them.
+RUN --mount=type=cache,id=pi_tracker_armhf_build,target=/src/build \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build --target pi_tracker solve_cli -j"$(nproc)" \
+ && mkdir -p /out \
+ && cp build/pi/pi_tracker build/pi/solve_cli /out/
+
+# Tiny runtime stage. Only libcamera + IPA modules; everything else is in the
+# binary. solve_cli has zero runtime deps.
+FROM --platform=linux/arm/v7 arm32v7/alpine:edge
+RUN apk add --no-cache libcamera libcamera-raspberrypi
+COPY --from=builder /out/pi_tracker /out/pi_tracker
+COPY --from=builder /out/solve_cli  /out/solve_cli

@@ -1,12 +1,21 @@
 #ifdef HAS_LIBCAMERA
 
 #include "camera_capture.h"
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
+#include <sys/mman.h>
 #include <libcamera/libcamera.h>
+#include <libcamera/control_ids.h>
+#include <libcamera/formats.h>
+#include <libcamera/base/object.h>
 
 using namespace libcamera;
 
-struct LibcameraCapture::Impl {
+// Inherits from libcamera::Object so it can be the receiver of the
+// requestCompleted signal in libcamera >= 0.2 (the API now requires an Object
+// receiver instead of accepting bare lambdas).
+struct LibcameraCapture::Impl : public Object {
     std::unique_ptr<CameraManager> cm;
     std::shared_ptr<Camera> camera;
     std::unique_ptr<CameraConfiguration> config;
@@ -14,9 +23,20 @@ struct LibcameraCapture::Impl {
     std::vector<std::unique_ptr<Request>> requests;
     Stream *stream = nullptr;
 
-    // Completed request storage
+    // Completed request signalled from libcamera's worker thread.
+    std::mutex mtx;
+    std::condition_variable cv;
     Request *completed_request = nullptr;
     bool request_completed = false;
+
+    void on_request_completed(Request *request) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            completed_request = request;
+            request_completed = true;
+        }
+        cv.notify_all();
+    }
 };
 
 LibcameraCapture::LibcameraCapture(int width, int height)
@@ -53,7 +73,10 @@ bool LibcameraCapture::initialize() {
         return false;
     }
 
-    // Configure for raw Bayer (SRGGB12 for IMX477)
+    // Raw Bayer stream. The default libcamera picks for the Pi is the CSI-2
+    // packed 10-bit format (5 bytes per 4 pixels), which is awkward to read.
+    // Force the unpacked variant so each pixel sits in one little-endian
+    // uint16 with the value in the low 10 bits.
     impl->config = impl->camera->generateConfiguration({StreamRole::Raw});
     if (!impl->config) {
         std::cerr << "Failed to generate camera configuration" << std::endl;
@@ -61,13 +84,19 @@ bool LibcameraCapture::initialize() {
     }
 
     StreamConfiguration &stream_config = impl->config->at(0);
-    stream_config.size.width = req_width * 2;  // Raw is full Bayer, we'll downsample
+    stream_config.size.width = req_width * 2;   // Raw is full Bayer, we'll downsample
     stream_config.size.height = req_height * 2;
+    stream_config.pixelFormat = formats::SBGGR10;  // IMX708/477/219 are all BGGR
 
     CameraConfiguration::Status status = impl->config->validate();
     if (status == CameraConfiguration::Invalid) {
         std::cerr << "Camera configuration invalid" << std::endl;
         return false;
+    }
+    if (stream_config.pixelFormat != formats::SBGGR10) {
+        std::cerr << "Warning: requested SBGGR10 but got "
+                  << stream_config.pixelFormat.toString()
+                  << " — the 2x2 Bayer averaging assumes 1 px per uint16\n";
     }
 
     ret = impl->camera->configure(impl->config.get());
@@ -97,33 +126,58 @@ bool LibcameraCapture::initialize() {
         impl->requests.push_back(std::move(request));
     }
 
-    // Connect signal for completed requests
+    // Connect with ConnectionTypeDirect so the slot runs on libcamera's worker
+    // thread (no event loop required on the main thread).
     impl->camera->requestCompleted.connect(
-        [this](Request *request) {
-            impl->completed_request = request;
-            impl->request_completed = true;
-        });
+        impl.get(), &Impl::on_request_completed, ConnectionTypeDirect);
 
-    ret = impl->camera->start();
+    // Fully manual: AE off (so ExposureTime + AnalogueGain stick), AF off
+    // (LensPosition is the source of truth). Seeded from the configured values.
+    ControlList start_controls(impl->camera->controls());
+    start_controls.set(controls::AeEnable, false);
+    start_controls.set(controls::ExposureTime,  static_cast<int32_t>(exposure_us_.load()));
+    start_controls.set(controls::AnalogueGain,  gain_.load());
+    start_controls.set(controls::AfMode, controls::AfModeManual);
+    start_controls.set(controls::LensPosition, lens_position_.load());
+
+    ret = impl->camera->start(&start_controls);
     if (ret) {
         std::cerr << "Failed to start camera: " << ret << std::endl;
         return false;
     }
 
-    std::cout << "Camera initialized: " << stream_config.toString() << std::endl;
+    std::cout << "Camera initialized: " << stream_config.toString()
+              << " (lens=" << lens_position_.load()
+              << " exposure_us=" << exposure_us_.load()
+              << " gain=" << gain_.load() << ")" << std::endl;
     return true;
 }
+
+void LibcameraCapture::set_lens_position(float diopters) { lens_position_.store(diopters); }
+void LibcameraCapture::set_exposure_us(uint32_t us)      { exposure_us_.store(us); }
+void LibcameraCapture::set_gain(float multiplier)        { gain_.store(multiplier); }
 
 std::optional<Frame> LibcameraCapture::capture() {
     if (!impl->camera || impl->requests.empty()) return std::nullopt;
 
-    // Queue a request
-    impl->request_completed = false;
+    // Apply the latest manual settings on this request so web UI tweaks take
+    // effect on the next exposure.
+    auto &rc = impl->requests[0]->controls();
+    rc.set(controls::LensPosition, lens_position_.load());
+    rc.set(controls::ExposureTime, static_cast<int32_t>(exposure_us_.load()));
+    rc.set(controls::AnalogueGain, gain_.load());
+
+    {
+        std::lock_guard<std::mutex> lock(impl->mtx);
+        impl->request_completed = false;
+        impl->completed_request = nullptr;
+    }
     impl->camera->queueRequest(impl->requests[0].get());
 
-    // Wait for completion (simple polling)
-    while (!impl->request_completed) {
-        impl->cm->processEvents();
+    // Wait for the request_completed signal callback to fire.
+    {
+        std::unique_lock<std::mutex> lock(impl->mtx);
+        impl->cv.wait(lock, [&]{ return impl->request_completed; });
     }
 
     if (impl->completed_request->status() != Request::RequestComplete) {
@@ -148,32 +202,32 @@ std::optional<Frame> LibcameraCapture::capture() {
         return std::nullopt;
     }
 
-    // Convert Bayer to grayscale by averaging 2x2 superpixels
-    int raw_width = impl->config->at(0).size.width;
-    int raw_height = impl->config->at(0).size.height;
-    int out_width = raw_width / 2;
+    // 2x2-bin the Bayer mosaic into grayscale. With SBGGR10 each pixel is one
+    // uint16; libcamera reports the row stride in bytes (may be padded), so we
+    // index rows by stride and reinterpret each row as uint16_t*.
+    const StreamConfiguration &sc = impl->config->at(0);
+    int raw_width  = sc.size.width;
+    int raw_height = sc.size.height;
+    unsigned int stride = sc.stride;
+    int out_width  = raw_width  / 2;
     int out_height = raw_height / 2;
 
     Frame frame;
     frame.width = out_width;
     frame.height = out_height;
-    frame.bit_depth = 12;
-    frame.data.resize(out_width * out_height);
+    frame.bit_depth = 10;
+    frame.data.resize(static_cast<size_t>(out_width) * out_height);
 
-    // SRGGB12 packed: each pixel is 12 bits
-    // For simplicity, treat as 16-bit (most libcamera raw formats are unpacked to 16-bit)
-    const uint16_t *raw = static_cast<const uint16_t *>(data);
-
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
     for (int y = 0; y < out_height; y++) {
+        int by = y * 2;
+        const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
+        const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
+        uint16_t *out = frame.data.data() + static_cast<size_t>(y) * out_width;
         for (int x = 0; x < out_width; x++) {
-            int by = y * 2;
             int bx = x * 2;
-            // Average 2x2 Bayer superpixel
-            uint32_t sum = raw[by * raw_width + bx] +
-                           raw[by * raw_width + bx + 1] +
-                           raw[(by + 1) * raw_width + bx] +
-                           raw[(by + 1) * raw_width + bx + 1];
-            frame.data[y * out_width + x] = static_cast<uint16_t>(sum / 4);
+            uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
+            out[x] = static_cast<uint16_t>(sum >> 2);
         }
     }
 

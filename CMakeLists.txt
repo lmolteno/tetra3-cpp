@@ -6,6 +6,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Prefer the static zlib so binaries can be statically linked against it.
+# Falls through to .so if the static build isn't installed.
+set(ZLIB_USE_STATIC_LIBS ON)
+
 # Build the shared solver library
 add_subdirectory(lib/solver)
 

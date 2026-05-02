@@ -3,30 +3,25 @@ project(pi_tracker)
 
 set(CMAKE_CXX_STANDARD 20)
 
-# Required dependencies
-find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
-
-# Sources always compiled
+# pi_tracker daemon: capture + render + JSON publish.
+# Solving is delegated to a solve_cli subprocess.
 set(PI_SOURCES
     src/main.cpp
     src/image_loader.cpp
-    src/star_detector.cpp
     src/star_map.cpp
     src/polar_align.cpp
-    src/display_i2c.cpp
     src/font_6x8.cpp
+    src/text.cpp
+    src/tracker_view.cpp
+    src/json_sink.cpp
+    src/frame_writer.cpp
+    src/solver_process.cpp
+    src/control_input.cpp
+    src/cam_state.cpp
 )
 
-# Optional: SDL2
-find_package(SDL2 QUIET)
-if(SDL2_FOUND)
-    message(STATUS "SDL2 found - enabling SDL display")
-    list(APPEND PI_SOURCES src/display_sdl.cpp)
-else()
-    message(STATUS "SDL2 not found - SDL display disabled")
-endif()
-
-# Optional: libcamera
+# Optional: libcamera (camera frame source). Stays dynamic — libcamera dlopens
+# IPA modules at runtime so it can't be static-linked cleanly.
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(LIBCAMERA QUIET libcamera)
@@ -35,22 +30,16 @@ if(LIBCAMERA_FOUND)
     message(STATUS "libcamera found - enabling camera capture")
     list(APPEND PI_SOURCES src/camera_capture.cpp)
 else()
-    message(STATUS "libcamera not found - camera capture disabled")
+    message(STATUS "libcamera not found - camera capture disabled (use --image)")
 endif()
 
 add_executable(pi_tracker ${PI_SOURCES})
-
 target_include_directories(pi_tracker PRIVATE src)
-target_link_libraries(pi_tracker PRIVATE
-    tetra3_solver
-    ${OpenCV_LIBS}
-)
+target_link_libraries(pi_tracker PRIVATE tetra3_solver)
 
-if(SDL2_FOUND)
-    target_compile_definitions(pi_tracker PRIVATE HAS_SDL_DISPLAY)
-    target_include_directories(pi_tracker PRIVATE ${SDL2_INCLUDE_DIRS})
-    target_link_libraries(pi_tracker PRIVATE ${SDL2_LIBRARIES})
-endif()
+# Static-link the C/C++ runtimes and zlib so the only runtime dep is libcamera.
+target_link_options(pi_tracker PRIVATE
+    -static-libstdc++ -static-libgcc -Wl,-Bstatic -lz -Wl,-Bdynamic)
 
 if(LIBCAMERA_FOUND)
     target_compile_definitions(pi_tracker PRIVATE HAS_LIBCAMERA)
@@ -58,26 +47,13 @@ if(LIBCAMERA_FOUND)
     target_link_libraries(pi_tracker PRIVATE ${LIBCAMERA_LIBRARIES})
 endif()
 
-# Solve CLI tool (no display dependencies)
+# solve_cli: fully static. No libcamera, no OpenCV — just stb_image + zlib +
+# Eigen (header-only) + the solver.
 add_executable(solve_cli
     src/solve_cli.cpp
     src/image_loader.cpp
     src/star_detector.cpp
 )
 target_include_directories(solve_cli PRIVATE src)
-target_link_libraries(solve_cli PRIVATE tetra3_solver ${OpenCV_LIBS})
-
-# Display test executable (SDL only)
-if(SDL2_FOUND)
-    add_executable(display_test
-        src/display_test.cpp
-        src/display_sdl.cpp
-        src/star_map.cpp
-        src/polar_align.cpp
-        src/font_6x8.cpp
-    )
-    target_include_directories(display_test PRIVATE src)
-    target_link_libraries(display_test PRIVATE tetra3_solver ${SDL2_LIBRARIES})
-    target_compile_definitions(display_test PRIVATE HAS_SDL_DISPLAY)
-    target_include_directories(display_test PRIVATE ${SDL2_INCLUDE_DIRS})
-endif()
+target_link_libraries(solve_cli PRIVATE tetra3_solver)
+target_link_options(solve_cli PRIVATE -static)

@@ -1,483 +1,296 @@
-#include <iostream>
-#include <string>
-#include <memory>
-#include <cstring>
-#include <cmath>
-#include <chrono>
-#include <cstdlib>
+// pi_tracker daemon: capture -> archive -> solve (out-of-process) -> render -> publish.
+//
+//   stdin  : NDJSON commands  ({"mode":...} | {"lens_pos":...} | {"exposure_us":...} | {"gain":...})
+//   stdout : NDJSON status    (tick state + base64 framebuffer)
+//   tmpfs  : rolling 10-frame archive (defaults to /dev/shm)
+//   state  : lens_position, exposure_us, gain (persistent, on the SD card)
+//
+// Solving runs as a `solve_cli --batch` subprocess; one solve in flight at a
+// time, with frames dropped while the solver is busy so the publish loop
+// stays at frame rate.
 
-#include <tetra3/solver.h>
-#include <tetra3/database_loader.h>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
 
 #include "frame_source.h"
 #include "image_loader.h"
-#include "star_detector.h"
-#include "display.h"
-#include "display_null.h"
-#include "star_map.h"
+#include "buffer_canvas.h"
+#include "tracker_view.h"
 #include "polar_align.h"
-
-#ifdef HAS_SDL_DISPLAY
-#include "display_sdl.h"
-#include <SDL2/SDL.h>
-#endif
+#include "json_sink.h"
+#include "frame_writer.h"
+#include "solver_process.h"
+#include "control_input.h"
+#include "cam_state.h"
 
 #ifdef HAS_LIBCAMERA
 #include "camera_capture.h"
 #endif
 
-#include "display_i2c.h"
-#include "display_buffer.h"
-
 struct AppConfig {
     std::string image_path;
-    int width = 2028;
-    int height = 1520;
-    std::string display_type = "sdl";
-    float fov = 11.0f;
-    std::string db_stars = "../tetra3_db_stars.bin";
-    std::string db_patterns = "../tetra3_db_patterns.bin";
+    int cam_width  = 2028;
+    int cam_height = 1520;
+    float lat = OBSERVER_LAT_DEG;
+    float lon = OBSERVER_LON_DEG;
+    std::string frames_dir = "/dev/shm/pi_tracker/frames";
+    std::string state_dir  = "./state";
+    float max_fps = 5.0f;
+
+    // Camera overrides (optional — saved state takes precedence otherwise).
+    bool     have_lens_pos    = false;  float    lens_pos    = 0.0f;
+    bool     have_exposure_us = false;  uint32_t exposure_us = 0;
+    bool     have_gain        = false;  float    gain        = 0.0f;
+
+    // Solver subprocess
+    std::string solver_path = "solve_cli";
+    std::string db_stars;
+    std::string db_patterns;
+    float fov_deg = 11.0f;
     float detection_sigma = 5.0f;
-    bool loop = false;
-    bool stdin_json = false;
+    int crop_size = 720;
+    int bg_tile = 128;
+    bool no_solver = false;
 };
 
 static AppConfig parse_args(int argc, char *argv[]) {
     AppConfig cfg;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--image" && i + 1 < argc) {
-            cfg.image_path = argv[++i];
-        } else if (arg == "--width" && i + 1 < argc) {
-            cfg.width = std::stoi(argv[++i]);
-        } else if (arg == "--height" && i + 1 < argc) {
-            cfg.height = std::stoi(argv[++i]);
-        } else if (arg == "--display" && i + 1 < argc) {
-            cfg.display_type = argv[++i];
-        } else if (arg == "--fov" && i + 1 < argc) {
-            cfg.fov = std::stof(argv[++i]);
-        } else if (arg == "--db-stars" && i + 1 < argc) {
-            cfg.db_stars = argv[++i];
-        } else if (arg == "--db-patterns" && i + 1 < argc) {
-            cfg.db_patterns = argv[++i];
-        } else if (arg == "--detection-sigma" && i + 1 < argc) {
-            cfg.detection_sigma = std::stof(argv[++i]);
-        } else if (arg == "--loop") {
-            cfg.loop = true;
-        } else if (arg == "--stdin-json") {
-            cfg.stdin_json = true;
-            cfg.loop = true; // stdin mode is always a loop
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: pi_tracker [options]\n"
-                      << "  --image <path>           Load 16-bit PNG/TIFF for testing\n"
-                      << "  --width <n>              Camera resolution width (default: 2028)\n"
-                      << "  --height <n>             Camera resolution height (default: 1520)\n"
-                      << "  --display sdl|i2c|none   Display backend (default: sdl)\n"
-                      << "  --fov <degrees>          FOV estimate (default: 11.0)\n"
-                      << "  --db-stars <path>        Star catalog path\n"
-                      << "  --db-patterns <path>     Pattern catalog path\n"
-                      << "  --detection-sigma <n>    Star detection threshold (default: 5.0)\n"
-                      << "  --loop                   Continuous capture mode\n"
-                      << "  --stdin-json             Read JSON solve results from stdin\n"
-                      << "\nStdin JSON format (one per line):\n"
-                      << "  {\"solved\":true,\"ra_rad\":1.5,\"dec_rad\":0.3,\"roll_rad\":0,\"fov_rad\":0.2}\n"
-                      << "  {\"solved\":false}\n"
-                      << "  {\"mode\":\"pa_sampling\"}  -- switch to PA sampling mode\n"
-                      << "  {\"mode\":\"pa_fix\"}       -- switch to PA fix mode\n"
-                      << "  {\"mode\":\"tracking\"}     -- switch to tracking mode\n"
-                      << "\nKeyboard (SDL):\n"
-                      << "  SPACE  Cycle: Tracking -> PA Sampling -> PA Fix -> Tracking\n"
-                      << "  ESC    Return to Tracking mode\n";
-            exit(0);
+        if      (arg == "--image"      && i + 1 < argc) cfg.image_path  = argv[++i];
+        else if (arg == "--width"      && i + 1 < argc) cfg.cam_width   = std::stoi(argv[++i]);
+        else if (arg == "--height"     && i + 1 < argc) cfg.cam_height  = std::stoi(argv[++i]);
+        else if (arg == "--lat"        && i + 1 < argc) cfg.lat         = std::stof(argv[++i]);
+        else if (arg == "--lon"        && i + 1 < argc) cfg.lon         = std::stof(argv[++i]);
+        else if (arg == "--frames-dir" && i + 1 < argc) cfg.frames_dir  = argv[++i];
+        else if (arg == "--state-dir"  && i + 1 < argc) cfg.state_dir   = argv[++i];
+        else if (arg == "--max-fps"    && i + 1 < argc) cfg.max_fps     = std::stof(argv[++i]);
+        else if (arg == "--lens-pos"    && i + 1 < argc) { cfg.lens_pos    = std::stof(argv[++i]); cfg.have_lens_pos    = true; }
+        else if (arg == "--exposure-us" && i + 1 < argc) { cfg.exposure_us = static_cast<uint32_t>(std::stoul(argv[++i])); cfg.have_exposure_us = true; }
+        else if (arg == "--gain"        && i + 1 < argc) { cfg.gain        = std::stof(argv[++i]); cfg.have_gain        = true; }
+        else if (arg == "--solver"     && i + 1 < argc) cfg.solver_path = argv[++i];
+        else if (arg == "--db-stars"   && i + 1 < argc) cfg.db_stars    = argv[++i];
+        else if (arg == "--db-patterns"&& i + 1 < argc) cfg.db_patterns = argv[++i];
+        else if (arg == "--fov"        && i + 1 < argc) cfg.fov_deg     = std::stof(argv[++i]);
+        else if (arg == "--detection-sigma" && i + 1 < argc) cfg.detection_sigma = std::stof(argv[++i]);
+        else if (arg == "--crop"       && i + 1 < argc) cfg.crop_size   = std::stoi(argv[++i]);
+        else if (arg == "--bg-tile"    && i + 1 < argc) cfg.bg_tile     = std::stoi(argv[++i]);
+        else if (arg == "--no-solver")                  cfg.no_solver   = true;
+        else if (arg == "--help" || arg == "-h") {
+            std::cerr <<
+                "Usage: pi_tracker [options]\n"
+                "  --image <path>            Use a test image instead of libcamera\n"
+                "  --width/--height <n>      Camera capture dims (default 2028x1520)\n"
+                "  --lat/--lon <deg>         Observer location (default compile-time)\n"
+                "  --frames-dir <path>       Rolling frame archive (default /dev/shm/pi_tracker/frames)\n"
+                "  --state-dir <path>        Persistent state dir  (default ./state)\n"
+                "  --max-fps <n>             Output rate cap       (default 5)\n"
+                "  --lens-pos <diopters>     Manual focus (overrides saved state)\n"
+                "  --exposure-us <us>        Exposure time (overrides saved state)\n"
+                "  --gain <x>                Analogue gain  (overrides saved state)\n"
+                "  --solver <path>           Path to solve_cli     (default 'solve_cli' on PATH)\n"
+                "  --db-stars/--db-patterns  Star catalog files (passed through to solve_cli)\n"
+                "  --fov <deg>               FOV hint for the solver (default 11)\n"
+                "  --detection-sigma <n>     Star detection threshold (default 5)\n"
+                "  --crop <n>                Solver crop size (default 720)\n"
+                "  --bg-tile <n>             Solver bg-tile size (default 128)\n"
+                "  --no-solver               Don't spawn solve_cli; emit no-solve frames only\n";
+            std::exit(0);
         }
     }
     return cfg;
 }
 
-// Simple input: poll keyboard for mode changes
-enum class InputEvent { None, ModeButton, BackButton };
-
-static InputEvent poll_input([[maybe_unused]] const std::string &display_type) {
-#ifdef HAS_SDL_DISPLAY
-    if (display_type == "sdl") {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) return InputEvent::BackButton;
-            if (ev.type == SDL_KEYDOWN) {
-                if (ev.key.keysym.sym == SDLK_SPACE) return InputEvent::ModeButton;
-                if (ev.key.keysym.sym == SDLK_ESCAPE) return InputEvent::BackButton;
-            }
-        }
-    }
-#endif
-    return InputEvent::None;
-}
-
-static double steady_now() {
-    return std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-// Minimal JSON value extraction (avoids pulling in a JSON library).
-// Handles: "key":1.5  "key":true  "key":false  "key":"string"
-static bool json_has_key(const std::string &json, const std::string &key) {
-    return json.find("\"" + key + "\"") != std::string::npos;
-}
-
-static double json_float(const std::string &json, const std::string &key, double def = 0) {
-    auto pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return def;
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return def;
-    return std::strtod(json.c_str() + pos + 1, nullptr);
-}
-
-static bool json_bool(const std::string &json, const std::string &key, bool def = false) {
-    auto pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return def;
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return def;
-    // skip whitespace
-    pos++;
-    while (pos < json.size() && json[pos] == ' ') pos++;
-    return json.compare(pos, 4, "true") == 0;
-}
-
-static std::string json_string(const std::string &json, const std::string &key) {
-    auto pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return "";
-    auto q1 = json.find('"', pos + 1);
-    if (q1 == std::string::npos) return "";
-    auto q2 = json.find('"', q1 + 1);
-    if (q2 == std::string::npos) return "";
-    return json.substr(q1 + 1, q2 - q1 - 1);
-}
-
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static std::string base64_encode(const uint8_t *data, size_t len) {
-    std::string out;
-    out.reserve((len + 2) / 3 * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
-        if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
-        if (i + 2 < len) n |= data[i + 2];
-        out += B64[(n >> 18) & 63];
-        out += B64[(n >> 12) & 63];
-        out += (i + 1 < len) ? B64[(n >> 6) & 63] : '=';
-        out += (i + 2 < len) ? B64[n & 63] : '=';
-    }
-    return out;
-}
-
-static void render_display(IDisplay &display, StarMapRenderer &star_map,
-                            PolarAligner &aligner, AppMode mode,
-                            const SolveResult &result) {
-    display.clear();
-
-    switch (mode) {
-    case AppMode::Tracking: {
-        if (result.solved) {
-            // Show the central half of the camera FOV on the map
-            float map_fov = result.fov * 0.5f;
-            star_map.render(display, result.ra, result.dec, map_fov,
-                            result.roll, IDisplay::MAP_Y0, IDisplay::MAP_Y1);
-        }
-        display.show_solve_result(result);
-        break;
-    }
-
-    case AppMode::PASampling: {
-        auto pole = aligner.estimate_pole();
-        display.show_pa_sampling(aligner.num_samples(), pole, result.solved);
-        break;
-    }
-
-    case AppMode::PAFix: {
-        auto pole = aligner.estimate_pole();
-        auto offset = aligner.pole_error(pole);
-        display.show_pa_fix(offset);
-        break;
-    }
-    }
-
-    display.update();
-}
-
-static void handle_mode_switch(InputEvent event, AppMode &mode,
-                                PolarAligner &aligner) {
-    if (event == InputEvent::ModeButton) {
-        switch (mode) {
-            case AppMode::Tracking:
-                mode = AppMode::PASampling;
-                aligner.clear_samples();
-                std::cerr << "Mode: PA Sampling" << std::endl;
-                break;
-            case AppMode::PASampling:
-                if (aligner.num_samples() >= 3) {
-                    mode = AppMode::PAFix;
-                    std::cerr << "Mode: PA Fix" << std::endl;
-                }
-                break;
-            case AppMode::PAFix:
-                mode = AppMode::Tracking;
-                std::cerr << "Mode: Tracking" << std::endl;
-                break;
-        }
-    } else if (event == InputEvent::BackButton) {
-        mode = AppMode::Tracking;
-        std::cerr << "Mode: Tracking" << std::endl;
-    }
-}
-
-// --stdin-json main loop: reads JSON lines from stdin, drives UI
-static int run_stdin_json(AppConfig &cfg, IDisplay &display) {
-    StarMapRenderer star_map;
-    PolarAligner aligner(OBSERVER_LAT_DEG, OBSERVER_LON_DEG);
-    AppMode mode = AppMode::Tracking;
-
-    display.show_status("Waiting...");
-
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        if (line.empty()) continue;
-
-        // Poll SDL events to keep window alive
-        auto event = poll_input(cfg.display_type);
-        if (event != InputEvent::None) {
-            handle_mode_switch(event, mode, aligner);
-        }
-
-        // Check for mode command
-        auto mode_str = json_string(line, "mode");
-        if (!mode_str.empty()) {
-            if (mode_str == "pa_sampling") {
-                mode = AppMode::PASampling;
-                aligner.clear_samples();
-                std::cerr << "Mode: PA Sampling" << std::endl;
-            } else if (mode_str == "pa_fix") {
-                if (aligner.num_samples() >= 3) {
-                    mode = AppMode::PAFix;
-                    std::cerr << "Mode: PA Fix" << std::endl;
-                }
-            } else if (mode_str == "tracking") {
-                mode = AppMode::Tracking;
-                std::cerr << "Mode: Tracking" << std::endl;
-            }
-
-            // Re-render with current state
-            SolveResult dummy{};
-            render_display(display, star_map, aligner, mode, dummy);
-            // Ack the command with framebuffer
-            std::string fb_str;
-            if (auto *fb = display.get_framebuffer())
-                fb_str = base64_encode(fb, IDisplay::FB_SIZE);
-            std::cout << "{\"ack\":\"" << mode_str << "\",\"fb\":\"" << fb_str << "\"}" << std::endl;
-            continue;
-        }
-
-        // Parse solve result
-        SolveResult result{};
-        result.solved = json_bool(line, "solved");
-        if (result.solved) {
-            result.ra = static_cast<float>(json_float(line, "ra_rad"));
-            result.dec = static_cast<float>(json_float(line, "dec_rad"));
-            result.roll = static_cast<float>(json_float(line, "roll_rad"));
-            result.fov = static_cast<float>(json_float(line, "fov_rad", 0.2));
-            result.rmse = static_cast<float>(json_float(line, "rmse"));
-            result.num_matches = static_cast<int>(json_float(line, "num_matches"));
-            result.solve_time_ms = static_cast<float>(json_float(line, "solve_time_ms"));
-        }
-
-        // Feed to polar alignment if in sampling/fix mode
-        if (result.solved && (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
-            aligner.add_sample(result.ra, result.dec, steady_now());
-        }
-
-        render_display(display, star_map, aligner, mode, result);
-
-        // Echo back status + framebuffer
-        std::string fb_str;
-        if (auto *fb = display.get_framebuffer())
-            fb_str = base64_encode(fb, IDisplay::FB_SIZE);
-
-        if (mode == AppMode::PAFix) {
-            auto pole = aligner.estimate_pole();
-            auto offset = aligner.pole_error(pole);
-            std::cout << "{\"mode\":\"pa_fix\",\"alt_arcmin\":"
-                      << offset.alt_arcmin << ",\"az_arcmin\":"
-                      << offset.az_arcmin << ",\"total_arcmin\":"
-                      << offset.total_arcmin
-                      << ",\"fb\":\"" << fb_str << "\"}" << std::endl;
-        } else if (mode == AppMode::PASampling) {
-            std::cout << "{\"mode\":\"pa_sampling\",\"num_samples\":"
-                      << aligner.num_samples()
-                      << ",\"fb\":\"" << fb_str << "\"}" << std::endl;
-        } else {
-            std::cout << "{\"mode\":\"tracking\",\"solved\":"
-                      << (result.solved ? "true" : "false")
-                      << ",\"fb\":\"" << fb_str << "\"}" << std::endl;
-        }
-    }
-
-    return 0;
-}
-
-// Normal main loop: capture, detect, solve
-static int run_normal(AppConfig &cfg, IDisplay &display) {
-    // Load catalogs
-    BinaryDatabaseLoader loader;
-    if (!loader.load_database(cfg.db_stars, cfg.db_patterns)) {
-        std::cerr << "Failed to load database!" << std::endl;
-        display.show_status("DB load fail");
-        return 1;
-    }
-    loader.print_info();
-
-    SimpleStarSolver solver;
-    solver.load_star_catalog(loader.get_stars());
-    solver.load_pattern_catalog(loader.get_patterns());
-    solver.print_memory_usage();
-
-    // Create frame source
-    std::unique_ptr<IFrameSource> source;
+static std::unique_ptr<IFrameSource> make_source(const AppConfig &cfg,
+                                                  const cam_state::Settings &s) {
     if (!cfg.image_path.empty()) {
-        source = std::make_unique<ImageFileSource>(cfg.image_path);
-    } else {
+        return std::make_unique<ImageFileSource>(cfg.image_path);
+    }
 #ifdef HAS_LIBCAMERA
-        source = std::make_unique<LibcameraCapture>(cfg.width, cfg.height);
+    auto cam = std::make_unique<LibcameraCapture>(cfg.cam_width, cfg.cam_height);
+    cam->set_lens_position(s.lens_pos);
+    cam->set_exposure_us(s.exposure_us);
+    cam->set_gain(s.gain);
+    return cam;
 #else
-        std::cerr << "No image specified and libcamera not available. Use --image <path>." << std::endl;
-        return 1;
+    (void)s;
+    std::cerr << "No --image given and libcamera not available at build time\n";
+    return nullptr;
 #endif
-    }
-
-    if (!source->initialize()) {
-        std::cerr << "Failed to initialize frame source" << std::endl;
-        display.show_status("Source fail");
-        return 1;
-    }
-
-    StarDetectorConfig det_cfg;
-    det_cfg.detection_sigma = cfg.detection_sigma;
-    StarDetector detector(det_cfg);
-    StarMapRenderer star_map;
-    PolarAligner aligner(OBSERVER_LAT_DEG, OBSERVER_LON_DEG);
-    AppMode mode = AppMode::Tracking;
-
-    do {
-        auto event = poll_input(cfg.display_type);
-        if (event == InputEvent::ModeButton) {
-            handle_mode_switch(event, mode, aligner);
-        } else if (event == InputEvent::BackButton) {
-            if (mode != AppMode::Tracking) {
-                handle_mode_switch(event, mode, aligner);
-            } else {
-                break;
-            }
-        }
-
-        display.show_status("Capturing...");
-
-        auto frame_opt = source->capture();
-        if (!frame_opt) {
-            std::cerr << "Failed to capture frame" << std::endl;
-            display.show_status("Capture fail");
-            continue;
-        }
-
-        auto &frame = *frame_opt;
-        std::cerr << "Frame: " << frame.width << "x" << frame.height
-                  << " " << frame.bit_depth << "-bit" << std::endl;
-
-        display.show_status("Detecting...");
-        auto detected_stars = detector.detect(frame);
-
-        if (detected_stars.empty()) {
-            std::cerr << "No stars detected" << std::endl;
-            display.show_status("No stars");
-            continue;
-        }
-
-        std::vector<Centroid> centroids;
-        centroids.reserve(detected_stars.size());
-        for (const auto &s : detected_stars) {
-            centroids.push_back(s.centroid);
-        }
-
-        display.show_status("Solving...");
-        auto result = solver.solve_from_centroids(
-            centroids, frame.height, frame.width, cfg.fov, 16,
-            0.01f, 0.001f, std::nullopt, cfg.fov * 0.2f);
-
-        if (result.solved && (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
-            aligner.add_sample(result.ra, result.dec, steady_now());
-        }
-
-        render_display(display, star_map, aligner, mode, result);
-
-        if (result.solved) {
-            std::cerr << "RA: " << result.ra * 180.0f / M_PI
-                      << " Dec: " << result.dec * 180.0f / M_PI
-                      << " FOV: " << result.fov * 180.0f / M_PI
-                      << " RMSE: " << result.rmse << "\"" << std::endl;
-        } else {
-            std::cerr << "No solution (" << result.solve_time_ms << " ms)" << std::endl;
-        }
-
-        if (!cfg.loop) {
-#ifdef HAS_SDL_DISPLAY
-            if (cfg.display_type == "sdl") {
-                std::cerr << "Press Ctrl+C to exit (SDL window open)..." << std::endl;
-                bool running = true;
-                while (running) {
-                    SDL_Event ev;
-                    while (SDL_PollEvent(&ev)) {
-                        if (ev.type == SDL_QUIT || ev.type == SDL_KEYDOWN) {
-                            running = false;
-                        }
-                    }
-                    SDL_Delay(100);
-                }
-            }
-#endif
-        }
-
-    } while (cfg.loop);
-
-    return 0;
 }
+
+// Allow Ctrl-C to break the loop cleanly.
+static std::atomic<bool> g_running{true};
+static void on_sigint(int) { g_running = false; }
 
 int main(int argc, char *argv[]) {
     AppConfig cfg = parse_args(argc, argv);
 
-    // Create display
-    std::unique_ptr<IDisplay> display;
-    if (cfg.stdin_json && cfg.display_type != "sdl") {
-        // For stdin-json mode, default to buffer display (has framebuffer, no GUI)
-        display = std::make_unique<BufferDisplay>();
-    } else if (cfg.display_type == "none") {
-        display = std::make_unique<NullDisplay>();
-    } else if (cfg.display_type == "i2c") {
-        display = std::make_unique<I2cSh1106Display>();
-#ifdef HAS_SDL_DISPLAY
-    } else if (cfg.display_type == "sdl") {
-        display = std::make_unique<SdlDisplay>();
-#endif
-    } else if (cfg.stdin_json) {
-        display = std::make_unique<BufferDisplay>();
-    } else {
-        std::cerr << "Unknown display type: " << cfg.display_type << std::endl;
+    std::signal(SIGINT, on_sigint);
+    std::signal(SIGTERM, on_sigint);
+    std::signal(SIGPIPE, SIG_IGN);  // writing to a closed stdout shouldn't kill us
+
+    BufferCanvas canvas;
+    TrackerView view;
+    PolarAligner aligner(cfg.lat, cfg.lon);
+    AppMode mode = AppMode::Tracking;
+    ControlInput input;
+
+    cam_state::Settings cs = cam_state::load(cfg.state_dir);
+    // CLI flags override saved state (and persist on use).
+    if (cfg.have_lens_pos)    { cs.lens_pos    = cfg.lens_pos;    cam_state::save_lens_pos   (cfg.state_dir, cs.lens_pos);    }
+    if (cfg.have_exposure_us) { cs.exposure_us = cfg.exposure_us; cam_state::save_exposure_us(cfg.state_dir, cs.exposure_us); }
+    if (cfg.have_gain)        { cs.gain        = cfg.gain;        cam_state::save_gain       (cfg.state_dir, cs.gain);        }
+
+    auto fill_state = [&](json_sink::State &s) {
+        s.mode = mode;
+        s.lens_pos    = cs.lens_pos;
+        s.exposure_us = cs.exposure_us;
+        s.gain        = cs.gain;
+    };
+
+    auto announce = [&](const std::string &msg) {
+        view.render_status(canvas, msg);
+        json_sink::State s;
+        fill_state(s);
+        s.fb = canvas.framebuffer();
+        s.fb_size = canvas.framebuffer_size();
+        json_sink::publish(std::cout, s);
+    };
+
+    announce("Starting");
+
+    auto source = make_source(cfg, cs);
+    if (!source) return 1;
+    if (!source->initialize()) {
+        announce("Source fail");
         return 1;
     }
 
-    display->show_status("Loading...");
-
-    if (cfg.stdin_json) {
-        return run_stdin_json(cfg, *display);
-    } else {
-        return run_normal(cfg, *display);
+    FrameWriter writer(cfg.frames_dir);
+    if (!writer.ensure_dir()) {
+        announce("Frames dir fail");
+        return 1;
     }
+
+    std::unique_ptr<SolverProcess> solver;
+    if (!cfg.no_solver) {
+        SolverProcess::Config sc;
+        sc.binary_path     = cfg.solver_path;
+        sc.db_stars        = cfg.db_stars;
+        sc.db_patterns     = cfg.db_patterns;
+        sc.fov_deg         = cfg.fov_deg;
+        sc.detection_sigma = cfg.detection_sigma;
+        sc.crop_size       = cfg.crop_size;
+        sc.bg_tile         = cfg.bg_tile;
+        solver = std::make_unique<SolverProcess>(std::move(sc));
+        if (!solver->start()) {
+            announce("Solver fail");
+            return 1;
+        }
+    }
+
+    const auto frame_period = std::chrono::nanoseconds(
+        static_cast<int64_t>(1e9 / cfg.max_fps));
+    auto next_tick = std::chrono::steady_clock::now();
+
+    SolveResult last_result{};
+    last_result.solved = false;
+    std::string last_frame_path;
+
+    auto now_steady = []() {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+#ifdef HAS_LIBCAMERA
+    auto *cam = dynamic_cast<LibcameraCapture *>(source.get());
+#else
+    void *cam = nullptr;
+#endif
+
+    while (g_running) {
+        next_tick += frame_period;
+
+        // 1. Drain any pending stdin commands.
+        for (const auto &cmd : input.poll()) {
+            if (cmd.mode) {
+                AppMode want = *cmd.mode;
+                if (want == AppMode::PAFix && aligner.num_samples() < 3) {
+                    // Need samples first; ignore promotion.
+                } else {
+                    if (want == AppMode::PASampling && mode != AppMode::PASampling) {
+                        aligner.clear_samples();
+                    }
+                    mode = want;
+                }
+            }
+            if (cmd.lens_pos) {
+                cs.lens_pos = *cmd.lens_pos;
+                cam_state::save_lens_pos(cfg.state_dir, cs.lens_pos);
+                if (cam) cam->set_lens_position(cs.lens_pos);
+            }
+            if (cmd.exposure_us) {
+                cs.exposure_us = *cmd.exposure_us;
+                cam_state::save_exposure_us(cfg.state_dir, cs.exposure_us);
+                if (cam) cam->set_exposure_us(cs.exposure_us);
+            }
+            if (cmd.gain) {
+                cs.gain = *cmd.gain;
+                cam_state::save_gain(cfg.state_dir, cs.gain);
+                if (cam) cam->set_gain(cs.gain);
+            }
+        }
+
+        // 2. Capture a frame.
+        auto frame = source->capture();
+        std::string frame_path;
+        if (frame) {
+            frame_path = writer.write(*frame);
+        }
+
+        // 3. Submit to the solver if it's free.
+        if (frame && solver && !frame_path.empty()) {
+            solver->submit(frame_path);
+        }
+
+        // 4. Pick up any fresh result.
+        if (solver) {
+            if (auto rs = solver->poll_fresh()) {
+                last_result = rs->result;
+                last_frame_path = rs->frame_path;
+                if (last_result.solved &&
+                    (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
+                    aligner.add_sample(last_result.ra, last_result.dec, now_steady());
+                }
+            }
+        }
+
+        // 5. Render + publish.
+        if (!frame) {
+            view.render_status(canvas, "Capture fail");
+        } else {
+            view.render(canvas, mode, last_result, aligner);
+        }
+
+        json_sink::State s;
+        fill_state(s);
+        s.result = last_result;
+        s.pa_samples = aligner.num_samples();
+        s.pole = aligner.estimate_pole();
+        s.offset = aligner.pole_error(s.pole);
+        s.frame_path = frame_path.empty() ? last_frame_path : frame_path;
+        s.fb = canvas.framebuffer();
+        s.fb_size = canvas.framebuffer_size();
+        json_sink::publish(std::cout, s);
+
+        std::this_thread::sleep_until(next_tick);
+    }
+
+    return 0;
 }

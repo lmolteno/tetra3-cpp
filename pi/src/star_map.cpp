@@ -143,21 +143,6 @@ void StarMapRenderer::render_impl(IStarMapCanvas &canvas, int w,
     }
 }
 
-// IDisplay adapter
-namespace {
-struct DisplayCanvas : IStarMapCanvas {
-    IDisplay &disp;
-    DisplayCanvas(IDisplay &d) : disp(d) {}
-    void draw_pixel(int x, int y) override { disp.draw_pixel(x, y); }
-};
-}
-
-void StarMapRenderer::render(IDisplay &disp, float ra, float dec, float fov_rad,
-                              float roll, int map_y0, int map_y1) {
-    DisplayCanvas canvas(disp);
-    render_impl(canvas, IDisplay::WIDTH, ra, dec, fov_rad, roll, map_y0, map_y1);
-}
-
 void StarMapRenderer::render(IStarMapCanvas &canvas, int width, int height,
                               float ra, float dec, float fov_rad, float roll) {
     render_impl(canvas, width, ra, dec, fov_rad, roll, 0, height - 1);

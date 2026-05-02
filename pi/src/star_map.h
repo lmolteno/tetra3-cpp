@@ -1,11 +1,9 @@
 #pragma once
 
-#include "display.h"
 #include <cmath>
 
-// Renders a star field onto an IDisplay using gnomonic projection.
+// Renders a star field onto an IStarMapCanvas using gnomonic projection.
 // Shows constellation stick figure lines and star dots scaled by magnitude.
-// Callback interface for star map rendering -- allows any resolution.
 struct IStarMapCanvas {
     virtual ~IStarMapCanvas() = default;
     virtual void draw_pixel(int x, int y) = 0;
@@ -13,11 +11,6 @@ struct IStarMapCanvas {
 
 class StarMapRenderer {
 public:
-    // Render onto IDisplay (128x64, uses IDisplay::WIDTH)
-    void render(IDisplay &disp, float ra, float dec, float fov_rad,
-                float roll = 0.0f, int map_y0 = 0, int map_y1 = 63);
-
-    // Render onto arbitrary-size canvas
     void render(IStarMapCanvas &canvas, int width, int height,
                 float ra, float dec, float fov_rad, float roll = 0.0f);
 
