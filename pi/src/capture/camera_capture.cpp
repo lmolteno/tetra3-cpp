@@ -2,6 +2,7 @@
 
 #include "capture/camera_capture.h"
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -194,6 +195,9 @@ void LibcameraCapture::set_gain(float multiplier)        { gain_.store(multiplie
 std::optional<Frame> LibcameraCapture::capture() {
     if (!impl->camera || impl->requests.empty()) return std::nullopt;
 
+    using clock = std::chrono::steady_clock;
+    auto t_wait = clock::now();
+
     // Block until the next frame comes back from the pipeline.
     Request *req = nullptr;
     {
@@ -202,6 +206,8 @@ std::optional<Frame> LibcameraCapture::capture() {
         req = impl->completed.front();
         impl->completed.pop_front();
     }
+    last_wait_ms_.store(
+        std::chrono::duration<float, std::milli>(clock::now() - t_wait).count());
 
     // Re-arm the request: reset, write only the controls whose desired value
     // differs from the last applied (Pi's IPA treats every control-on-request
@@ -272,6 +278,7 @@ std::optional<Frame> LibcameraCapture::capture() {
     frame.bit_depth = 10;
     frame.data.resize(static_cast<size_t>(out_width) * out_height);
 
+    auto t_bin = clock::now();
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
     for (int y = 0; y < out_height; y++) {
         int by = y * 2;
@@ -284,6 +291,8 @@ std::optional<Frame> LibcameraCapture::capture() {
             out[x] = static_cast<uint16_t>(sum >> 2);
         }
     }
+    last_bin_ms_.store(
+        std::chrono::duration<float, std::milli>(clock::now() - t_bin).count());
 
     munmap(data, planes[0].length);
 

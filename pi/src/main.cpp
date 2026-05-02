@@ -312,6 +312,10 @@ int main(int argc, char *argv[]) {
         s.timing = last_solve_timing;
         s.timing.capture = capture_ms;
         s.timing.archive = archive_ms;
+        apply_to_camera([&](auto *cam) {
+            s.timing.wait = cam->last_wait_ms();
+            s.timing.bin  = cam->last_bin_ms();
+        });
         if (last_result_at != clock::time_point{}) {
             s.timing.result_age = ms_since(last_result_at);
         }

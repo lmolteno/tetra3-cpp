@@ -90,6 +90,8 @@ void publish(std::ostream &out, const State &s) {
                 sep = ",";
             };
             emit("capture",    t.capture);
+            emit("wait",       t.wait);
+            emit("bin",        t.bin);
             emit("archive",    t.archive);
             emit("load",       t.load);
             emit("detect",     t.detect);

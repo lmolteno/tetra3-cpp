@@ -20,6 +20,8 @@ namespace json_sink {
 // result is at publish time.
 struct Timing {
     float capture     = -1.0f;
+    float wait        = -1.0f;   // libcamera (capture sub-stage): exposure + readout + ISP
+    float bin         = -1.0f;   // 2x2 Bayer averaging (capture sub-stage)
     float archive     = -1.0f;
     float load        = -1.0f;
     float detect      = -1.0f;
