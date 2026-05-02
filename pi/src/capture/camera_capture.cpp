@@ -1,7 +1,10 @@
 #ifdef HAS_LIBCAMERA
 
 #include "capture/camera_capture.h"
+#include <array>
+#include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <sys/mman.h>
@@ -23,19 +26,28 @@ struct LibcameraCapture::Impl : public Object {
     std::vector<std::unique_ptr<Request>> requests;
     Stream *stream = nullptr;
 
-    // Completed request signalled from libcamera's worker thread.
+    // FIFO of completed requests pushed by libcamera's worker thread, popped
+    // by capture() on the main thread. We keep all allocated requests queued
+    // continuously (re-queued the moment they come back) so the camera always
+    // has work to do — no missed sensor cycles between captures.
     std::mutex mtx;
     std::condition_variable cv;
-    Request *completed_request = nullptr;
-    bool request_completed = false;
+    std::deque<Request *> completed;
+
+    // Last control values we actually wrote into a Request. Compared against
+    // the atomics on every re-queue so we only set controls when something
+    // actually changed — Pi's IPA treats any control-on-request as a change
+    // and lags new values by ~2 frames before they take effect.
+    float    applied_lens        = std::nanf("");
+    uint32_t applied_exposure_us = 0;
+    float    applied_gain        = std::nanf("");
 
     void on_request_completed(Request *request) {
         {
             std::lock_guard<std::mutex> lock(mtx);
-            completed_request = request;
-            request_completed = true;
+            completed.push_back(request);
         }
-        cv.notify_all();
+        cv.notify_one();
     }
 };
 
@@ -132,13 +144,23 @@ bool LibcameraCapture::initialize() {
         impl.get(), &Impl::on_request_completed, ConnectionTypeDirect);
 
     // Fully manual: AE off (so ExposureTime + AnalogueGain stick), AF off
-    // (LensPosition is the source of truth). Seeded from the configured values.
+    // (LensPosition is the source of truth). FrameDurationLimits pinned to the
+    // exposure time so the pipeline doesn't try to clamp it. Initial values
+    // are set here and tracked in applied_* so apply_pending_controls() knows
+    // what's already in effect and only writes deltas.
+    const uint32_t initial_exposure = exposure_us_.load();
+    const float    initial_gain     = gain_.load();
+    const float    initial_lens     = lens_position_.load();
+    const std::array<int64_t, 2> fdur = { initial_exposure, initial_exposure };
+
     ControlList start_controls(impl->camera->controls());
     start_controls.set(controls::AeEnable, false);
-    start_controls.set(controls::ExposureTime,  static_cast<int32_t>(exposure_us_.load()));
-    start_controls.set(controls::AnalogueGain,  gain_.load());
-    start_controls.set(controls::AfMode, controls::AfModeManual);
-    start_controls.set(controls::LensPosition, lens_position_.load());
+    start_controls.set(controls::AfMode,        controls::AfModeManual);
+    start_controls.set(controls::ExposureTime,  static_cast<int32_t>(initial_exposure));
+    start_controls.set(controls::AnalogueGain,  initial_gain);
+    start_controls.set(controls::LensPosition,  initial_lens);
+    start_controls.set(controls::FrameDurationLimits,
+                       Span<const int64_t, 2>(fdur));
 
     ret = impl->camera->start(&start_controls);
     if (ret) {
@@ -146,10 +168,22 @@ bool LibcameraCapture::initialize() {
         return false;
     }
 
+    impl->applied_lens        = initial_lens;
+    impl->applied_exposure_us = initial_exposure;
+    impl->applied_gain        = initial_gain;
+
+    // Pre-fill the pipeline. Every allocated request is queued up front so
+    // the camera always has frames in flight. As each one completes, capture()
+    // re-queues it.
+    for (auto &req : impl->requests) {
+        impl->camera->queueRequest(req.get());
+    }
+
     std::cout << "Camera initialized: " << stream_config.toString()
-              << " (lens=" << lens_position_.load()
-              << " exposure_us=" << exposure_us_.load()
-              << " gain=" << gain_.load() << ")" << std::endl;
+              << " (lens=" << initial_lens
+              << " exposure_us=" << initial_exposure
+              << " gain=" << initial_gain
+              << ", " << impl->requests.size() << " requests pre-queued)" << std::endl;
     return true;
 }
 
@@ -160,45 +194,65 @@ void LibcameraCapture::set_gain(float multiplier)        { gain_.store(multiplie
 std::optional<Frame> LibcameraCapture::capture() {
     if (!impl->camera || impl->requests.empty()) return std::nullopt;
 
-    // Apply the latest manual settings on this request so web UI tweaks take
-    // effect on the next exposure.
-    auto &rc = impl->requests[0]->controls();
-    rc.set(controls::LensPosition, lens_position_.load());
-    rc.set(controls::ExposureTime, static_cast<int32_t>(exposure_us_.load()));
-    rc.set(controls::AnalogueGain, gain_.load());
-
-    {
-        std::lock_guard<std::mutex> lock(impl->mtx);
-        impl->request_completed = false;
-        impl->completed_request = nullptr;
-    }
-    impl->camera->queueRequest(impl->requests[0].get());
-
-    // Wait for the request_completed signal callback to fire.
+    // Block until the next frame comes back from the pipeline.
+    Request *req = nullptr;
     {
         std::unique_lock<std::mutex> lock(impl->mtx);
-        impl->cv.wait(lock, [&]{ return impl->request_completed; });
+        impl->cv.wait(lock, [&]{ return !impl->completed.empty(); });
+        req = impl->completed.front();
+        impl->completed.pop_front();
     }
 
-    if (impl->completed_request->status() != Request::RequestComplete) {
-        std::cerr << "Request failed" << std::endl;
+    // Re-arm the request: reset, write only the controls whose desired value
+    // differs from the last applied (Pi's IPA treats every control-on-request
+    // as a change-signal and lags the next ~2 frames if anything is set).
+    auto requeue = [&](Request *r) {
+        r->reuse(Request::ReuseBuffers);
+        auto &rc = r->controls();
+
+        float    new_lens   = lens_position_.load();
+        uint32_t new_exp_us = exposure_us_.load();
+        float    new_gain   = gain_.load();
+
+        if (new_lens != impl->applied_lens) {
+            rc.set(controls::LensPosition, new_lens);
+            impl->applied_lens = new_lens;
+        }
+        if (new_exp_us != impl->applied_exposure_us) {
+            rc.set(controls::ExposureTime, static_cast<int32_t>(new_exp_us));
+            // Frame duration must accommodate the exposure or the pipeline
+            // clamps it. Pin both ends to the exposure time.
+            const std::array<int64_t, 2> fdur = { new_exp_us, new_exp_us };
+            rc.set(controls::FrameDurationLimits, Span<const int64_t, 2>(fdur));
+            impl->applied_exposure_us = new_exp_us;
+        }
+        if (new_gain != impl->applied_gain) {
+            rc.set(controls::AnalogueGain, new_gain);
+            impl->applied_gain = new_gain;
+        }
+
+        impl->camera->queueRequest(r);
+    };
+
+    if (req->status() != Request::RequestComplete) {
+        std::cerr << "Request failed (status=" << static_cast<int>(req->status()) << ")" << std::endl;
+        requeue(req);
         return std::nullopt;
     }
 
-    // Get the buffer
-    const auto &buffers = impl->completed_request->buffers();
+    const auto &buffers = req->buffers();
     auto it = buffers.find(impl->stream);
-    if (it == buffers.end()) return std::nullopt;
+    if (it == buffers.end()) { requeue(req); return std::nullopt; }
 
     FrameBuffer *buffer = it->second;
     const auto &planes = buffer->planes();
-    if (planes.empty()) return std::nullopt;
+    if (planes.empty()) { requeue(req); return std::nullopt; }
 
-    // Map the buffer
     void *data = mmap(nullptr, planes[0].length, PROT_READ, MAP_SHARED,
                       planes[0].fd.get(), planes[0].offset);
     if (data == MAP_FAILED) {
         std::cerr << "Failed to mmap buffer" << std::endl;
+        requeue(req);
         return std::nullopt;
     }
 
@@ -233,9 +287,7 @@ std::optional<Frame> LibcameraCapture::capture() {
 
     munmap(data, planes[0].length);
 
-    // Reuse the request
-    impl->completed_request->reuse(Request::ReuseBuffers);
-
+    requeue(req);
     return frame;
 }
 
