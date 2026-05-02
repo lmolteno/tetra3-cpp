@@ -9,6 +9,10 @@
 #include <iostream>
 #include <mutex>
 #include <sys/mman.h>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <libcamera/libcamera.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
@@ -285,7 +289,21 @@ std::optional<Frame> LibcameraCapture::capture() {
         const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
         const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
         uint16_t *out = frame.data.data() + static_cast<size_t>(y) * out_width;
-        for (int x = 0; x < out_width; x++) {
+        int x = 0;
+#if defined(__ARM_NEON)
+        // 8 output pixels per iteration. With 10-bit input the sum of 4
+        // samples fits comfortably in 16 bits (max 4*1023 = 4092), so we
+        // stay in u16 the whole way through.
+        for (; x + 8 <= out_width; x += 8) {
+            uint16x8x2_t r0 = vld2q_u16(row0 + x * 2);  // even/odd deinterleave
+            uint16x8x2_t r1 = vld2q_u16(row1 + x * 2);
+            uint16x8_t s0  = vaddq_u16(r0.val[0], r0.val[1]);
+            uint16x8_t s1  = vaddq_u16(r1.val[0], r1.val[1]);
+            uint16x8_t avg = vshrq_n_u16(vaddq_u16(s0, s1), 2);
+            vst1q_u16(out + x, avg);
+        }
+#endif
+        for (; x < out_width; x++) {
             int bx = x * 2;
             uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
             out[x] = static_cast<uint16_t>(sum >> 2);

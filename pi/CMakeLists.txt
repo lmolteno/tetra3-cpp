@@ -40,6 +40,14 @@ add_executable(pi_tracker ${PI_SOURCES})
 target_include_directories(pi_tracker PRIVATE src)
 target_link_libraries(pi_tracker PRIVATE tetra3_solver)
 
+# Pi 2 (Cortex-A7) and up have NEON. Alpine's armhf default is vfpv3-d16 with
+# no NEON; flip it on so __ARM_NEON is defined and the SIMD bin loop in
+# capture/camera_capture.cpp actually compiles.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|armv7|armhf)" AND
+   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64")
+    target_compile_options(pi_tracker PRIVATE -mfpu=neon-vfpv4)
+endif()
+
 # Static-link the C/C++ runtimes and zlib so the only runtime dep is libcamera.
 target_link_options(pi_tracker PRIVATE
     -static-libstdc++ -static-libgcc -Wl,-Bstatic -lz -Wl,-Bdynamic)
