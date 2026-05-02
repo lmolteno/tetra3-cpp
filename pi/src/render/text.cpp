@@ -1,5 +1,5 @@
-#include "text.h"
-#include "font_6x8.h"
+#include "render/text.h"
+#include "render/font_6x8.h"
 
 namespace text {
 

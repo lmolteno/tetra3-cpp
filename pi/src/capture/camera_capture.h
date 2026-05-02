@@ -2,7 +2,7 @@
 
 #ifdef HAS_LIBCAMERA
 
-#include "frame_source.h"
+#include "capture/frame_source.h"
 #include <atomic>
 #include <memory>
 

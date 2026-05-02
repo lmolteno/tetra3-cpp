@@ -14,9 +14,9 @@
 #include <tetra3/solver.h>
 #include <tetra3/database_loader.h>
 
-#include "frame_source.h"
-#include "image_loader.h"
-#include "star_detector.h"
+#include "capture/frame_source.h"
+#include "capture/image_loader.h"
+#include "solver/star_detector.h"
 
 static void solve_image(const std::string &image_path,
                         SimpleStarSolver &solver,

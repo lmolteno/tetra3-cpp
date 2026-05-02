@@ -1,6 +1,6 @@
 #pragma once
 
-#include "canvas.h"
+#include "render/canvas.h"
 #include <string>
 
 namespace text {

@@ -1,4 +1,4 @@
-#include "star_detector.h"
+#include "solver/star_detector.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>

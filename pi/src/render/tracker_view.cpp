@@ -1,5 +1,5 @@
-#include "tracker_view.h"
-#include "text.h"
+#include "render/tracker_view.h"
+#include "render/text.h"
 
 #include <cmath>
 #include <cstdio>

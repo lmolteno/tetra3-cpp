@@ -1,4 +1,4 @@
-#include "image_loader.h"
+#include "capture/image_loader.h"
 
 #include <cstdint>
 #include <cstdio>

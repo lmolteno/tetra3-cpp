@@ -1,4 +1,4 @@
-#include "font_6x8.h"
+#include "render/font_6x8.h"
 
 // 6x8 bitmap font (ASCII 32-127)
 // Each character is 6 columns wide, 8 rows tall, stored as 6 bytes (one per column)

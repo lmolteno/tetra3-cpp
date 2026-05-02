@@ -1,5 +1,5 @@
-#include "star_map.h"
-#include "star_map_data.h"
+#include "render/star_map.h"
+#include "render/star_map_data.h"
 #include <cmath>
 #include <algorithm>
 

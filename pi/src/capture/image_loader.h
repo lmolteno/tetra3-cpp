@@ -1,6 +1,6 @@
 #pragma once
 
-#include "frame_source.h"
+#include "capture/frame_source.h"
 #include <string>
 
 class ImageFileSource : public IFrameSource {

@@ -17,19 +17,19 @@
 #include <string>
 #include <thread>
 
-#include "frame_source.h"
-#include "image_loader.h"
-#include "buffer_canvas.h"
-#include "tracker_view.h"
-#include "polar_align.h"
-#include "json_sink.h"
-#include "frame_writer.h"
-#include "solver_process.h"
-#include "control_input.h"
-#include "cam_state.h"
+#include "capture/frame_source.h"
+#include "capture/image_loader.h"
+#include "render/buffer_canvas.h"
+#include "render/tracker_view.h"
+#include "app/polar_align.h"
+#include "io/json_sink.h"
+#include "capture/frame_writer.h"
+#include "solver/solver_process.h"
+#include "io/control_input.h"
+#include "app/cam_state.h"
 
 #ifdef HAS_LIBCAMERA
-#include "camera_capture.h"
+#include "capture/camera_capture.h"
 #endif
 
 struct AppConfig {
@@ -208,11 +208,16 @@ int main(int argc, char *argv[]) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
 
+    // Apply a camera tweak if we're actually driving a libcamera source. Falls
+    // through to a no-op for the file-source case (or when libcamera wasn't
+    // available at build time).
+    auto apply_to_camera = [&](auto fn) {
 #ifdef HAS_LIBCAMERA
-    auto *cam = dynamic_cast<LibcameraCapture *>(source.get());
+        if (auto *cam = dynamic_cast<LibcameraCapture *>(source.get())) fn(cam);
 #else
-    void *cam = nullptr;
+        (void)fn;
 #endif
+    };
 
     while (g_running) {
         next_tick += frame_period;
@@ -233,17 +238,17 @@ int main(int argc, char *argv[]) {
             if (cmd.lens_pos) {
                 cs.lens_pos = *cmd.lens_pos;
                 cam_state::save_lens_pos(cfg.state_dir, cs.lens_pos);
-                if (cam) cam->set_lens_position(cs.lens_pos);
+                apply_to_camera([&](auto *cam) { cam->set_lens_position(cs.lens_pos); });
             }
             if (cmd.exposure_us) {
                 cs.exposure_us = *cmd.exposure_us;
                 cam_state::save_exposure_us(cfg.state_dir, cs.exposure_us);
-                if (cam) cam->set_exposure_us(cs.exposure_us);
+                apply_to_camera([&](auto *cam) { cam->set_exposure_us(cs.exposure_us); });
             }
             if (cmd.gain) {
                 cs.gain = *cmd.gain;
                 cam_state::save_gain(cfg.state_dir, cs.gain);
-                if (cam) cam->set_gain(cs.gain);
+                apply_to_camera([&](auto *cam) { cam->set_gain(cs.gain); });
             }
         }
 

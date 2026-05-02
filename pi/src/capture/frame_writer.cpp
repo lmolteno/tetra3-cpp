@@ -1,4 +1,4 @@
-#include "frame_writer.h"
+#include "capture/frame_writer.h"
 
 #include <cstdio>
 #include <filesystem>

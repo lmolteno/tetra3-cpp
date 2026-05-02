@@ -1,8 +1,8 @@
 #pragma once
 
-#include "canvas.h"
-#include "polar_align.h"
-#include "star_map.h"
+#include "render/canvas.h"
+#include "app/polar_align.h"
+#include "render/star_map.h"
 #include <tetra3/types.h>
 #include <string>
 

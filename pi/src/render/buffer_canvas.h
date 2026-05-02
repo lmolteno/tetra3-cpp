@@ -1,6 +1,6 @@
 #pragma once
 
-#include "canvas.h"
+#include "render/canvas.h"
 #include <array>
 
 // Headless 128x64 1-bit canvas. Same byte layout as the SH1106 (page-major:

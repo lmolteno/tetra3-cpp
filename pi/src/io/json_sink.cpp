@@ -1,4 +1,4 @@
-#include "json_sink.h"
+#include "io/json_sink.h"
 #include <ostream>
 
 namespace json_sink {

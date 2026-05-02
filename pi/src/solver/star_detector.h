@@ -1,7 +1,7 @@
 #pragma once
 
 #include <tetra3/types.h>
-#include "frame_source.h"
+#include "capture/frame_source.h"
 #include <vector>
 #include <cstdint>
 

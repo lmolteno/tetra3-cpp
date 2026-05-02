@@ -1,6 +1,6 @@
 #ifdef HAS_LIBCAMERA
 
-#include "camera_capture.h"
+#include "capture/camera_capture.h"
 #include <condition_variable>
 #include <iostream>
 #include <mutex>

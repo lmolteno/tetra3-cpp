@@ -5,19 +5,22 @@ set(CMAKE_CXX_STANDARD 20)
 
 # pi_tracker daemon: capture + render + JSON publish.
 # Solving is delegated to a solve_cli subprocess.
+#
+# Source tree is grouped by module — capture/, solver/, render/, io/, app/.
+# Includes use module-prefixed paths (e.g. #include "render/canvas.h").
 set(PI_SOURCES
     src/main.cpp
-    src/image_loader.cpp
-    src/star_map.cpp
-    src/polar_align.cpp
-    src/font_6x8.cpp
-    src/text.cpp
-    src/tracker_view.cpp
-    src/json_sink.cpp
-    src/frame_writer.cpp
-    src/solver_process.cpp
-    src/control_input.cpp
-    src/cam_state.cpp
+    src/capture/image_loader.cpp
+    src/capture/frame_writer.cpp
+    src/solver/solver_process.cpp
+    src/render/star_map.cpp
+    src/render/font_6x8.cpp
+    src/render/text.cpp
+    src/render/tracker_view.cpp
+    src/io/json_sink.cpp
+    src/io/control_input.cpp
+    src/app/polar_align.cpp
+    src/app/cam_state.cpp
 )
 
 # Optional: libcamera (camera frame source). Stays dynamic — libcamera dlopens
@@ -28,7 +31,7 @@ if(PkgConfig_FOUND)
 endif()
 if(LIBCAMERA_FOUND)
     message(STATUS "libcamera found - enabling camera capture")
-    list(APPEND PI_SOURCES src/camera_capture.cpp)
+    list(APPEND PI_SOURCES src/capture/camera_capture.cpp)
 else()
     message(STATUS "libcamera not found - camera capture disabled (use --image)")
 endif()
@@ -50,9 +53,9 @@ endif()
 # solve_cli: fully static. No libcamera, no OpenCV — just stb_image + zlib +
 # Eigen (header-only) + the solver.
 add_executable(solve_cli
-    src/solve_cli.cpp
-    src/image_loader.cpp
-    src/star_detector.cpp
+    src/solver/solve_cli.cpp
+    src/capture/image_loader.cpp
+    src/solver/star_detector.cpp
 )
 target_include_directories(solve_cli PRIVATE src)
 target_link_libraries(solve_cli PRIVATE tetra3_solver)

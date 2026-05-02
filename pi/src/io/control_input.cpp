@@ -1,4 +1,4 @@
-#include "control_input.h"
+#include "io/control_input.h"
 
 #include <cerrno>
 #include <cstdlib>
