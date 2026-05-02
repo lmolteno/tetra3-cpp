@@ -202,6 +202,8 @@ int main(int argc, char *argv[]) {
     SolveResult last_result{};
     last_result.solved = false;
     std::string last_frame_path;
+    json_sink::Timing last_solve_timing;          // load/detect/match/solve_wall from latest result
+    std::chrono::steady_clock::time_point last_result_at{};
 
     auto now_steady = []() {
         return std::chrono::duration<double>(
@@ -252,11 +254,22 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        using clock = std::chrono::steady_clock;
+        auto ms_since = [](clock::time_point t) {
+            return std::chrono::duration<float, std::milli>(clock::now() - t).count();
+        };
+
         // 2. Capture a frame.
+        auto t_capture = clock::now();
         auto frame = source->capture();
+        float capture_ms = ms_since(t_capture);
+
         std::string frame_path;
+        float archive_ms = -1.0f;
         if (frame) {
+            auto t_archive = clock::now();
             frame_path = writer.write(*frame);
+            archive_ms = ms_since(t_archive);
         }
 
         // 3. Submit to the solver if it's free.
@@ -269,6 +282,12 @@ int main(int argc, char *argv[]) {
             if (auto rs = solver->poll_fresh()) {
                 last_result = rs->result;
                 last_frame_path = rs->frame_path;
+                last_solve_timing = json_sink::Timing{};
+                last_solve_timing.load       = rs->load_ms;
+                last_solve_timing.detect     = rs->detect_ms;
+                last_solve_timing.match      = last_result.solve_time_ms;
+                last_solve_timing.solve_wall = rs->wall_ms;
+                last_result_at = rs->received_at;
                 if (last_result.solved &&
                     (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
                     aligner.add_sample(last_result.ra, last_result.dec, now_steady());
@@ -290,6 +309,12 @@ int main(int argc, char *argv[]) {
         s.pole = aligner.estimate_pole();
         s.offset = aligner.pole_error(s.pole);
         s.frame_path = frame_path.empty() ? last_frame_path : frame_path;
+        s.timing = last_solve_timing;
+        s.timing.capture = capture_ms;
+        s.timing.archive = archive_ms;
+        if (last_result_at != clock::time_point{}) {
+            s.timing.result_age = ms_since(last_result_at);
+        }
         s.fb = canvas.framebuffer();
         s.fb_size = canvas.framebuffer_size();
         json_sink::publish(std::cout, s);

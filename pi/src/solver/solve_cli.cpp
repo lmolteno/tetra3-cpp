@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #include <tetra3/solver.h>
 #include <tetra3/database_loader.h>
@@ -22,6 +23,12 @@ static void solve_image(const std::string &image_path,
                         SimpleStarSolver &solver,
                         float fov, float detection_sigma, int crop_size,
                         int bg_tile_size, bool debug) {
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(clock::now() - t).count();
+    };
+
+    auto t_load = clock::now();
     ImageFileSource source(image_path, debug);
     if (!source.initialize()) {
         printf("{\"solved\":false,\"error\":\"image_load_failed\"}\n");
@@ -35,6 +42,7 @@ static void solve_image(const std::string &image_path,
         fflush(stdout);
         return;
     }
+    double load_ms = ms_since(t_load);
 
     auto &frame = *frame_opt;
 
@@ -43,10 +51,14 @@ static void solve_image(const std::string &image_path,
     det_cfg.bg_tile_size = bg_tile_size;
     det_cfg.verbose = debug;
     StarDetector detector(det_cfg);
+
+    auto t_detect = clock::now();
     auto detected = detector.detect(frame);
+    double detect_ms = ms_since(t_detect);
 
     if (detected.empty()) {
-        printf("{\"solved\":false,\"error\":\"no_stars\",\"num_detected\":0}\n");
+        printf("{\"solved\":false,\"error\":\"no_stars\",\"num_detected\":0,"
+               "\"load_ms\":%.1f,\"detect_ms\":%.1f}\n", load_ms, detect_ms);
         fflush(stdout);
         return;
     }
@@ -76,7 +88,9 @@ static void solve_image(const std::string &image_path,
 
     SolveResult result = {false, 0, 0, 0, 0, 0, 0, 0, 0.0f};
 
+    auto t_crop_detect = clock::now();
     auto crop_detected = detector.detect(crop_frame);
+    detect_ms += ms_since(t_crop_detect);
     if (crop_detected.size() >= 4) {
         std::vector<Centroid> crop_centroids;
         crop_centroids.reserve(crop_detected.size());
@@ -110,24 +124,29 @@ static void solve_image(const std::string &image_path,
             0.01f, 0.001f, std::nullopt, fov * 0.2f);
     }
 
-    // Output JSON
+    // Output JSON. solve_time_ms is the matcher's internal time (just pattern
+    // search); load_ms / detect_ms cover the rest of solve_cli's wall clock.
     if (result.solved) {
         printf("{\"solved\":true,"
                "\"ra_rad\":%.8f,\"dec_rad\":%.8f,\"roll_rad\":%.8f,"
                "\"fov_rad\":%.8f,\"rmse\":%.4f,"
                "\"num_matches\":%d,\"solve_time_ms\":%.1f,"
+               "\"load_ms\":%.1f,\"detect_ms\":%.1f,"
                "\"num_detected\":%d,"
                "\"ra_deg\":%.6f,\"dec_deg\":%.6f,\"fov_deg\":%.6f}\n",
                result.ra, result.dec, result.roll,
                result.fov, result.rmse,
                result.num_matches, result.solve_time_ms,
+               load_ms, detect_ms,
                num_detected_full,
                result.ra * 180.0 / M_PI,
                result.dec * 180.0 / M_PI,
                result.fov * 180.0 / M_PI);
     } else {
-        printf("{\"solved\":false,\"solve_time_ms\":%.1f,\"num_detected\":%d}\n",
-               result.solve_time_ms, num_detected_full);
+        printf("{\"solved\":false,\"solve_time_ms\":%.1f,"
+               "\"load_ms\":%.1f,\"detect_ms\":%.1f,"
+               "\"num_detected\":%d}\n",
+               result.solve_time_ms, load_ms, detect_ms, num_detected_full);
     }
     fflush(stdout);
 }

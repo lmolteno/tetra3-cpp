@@ -110,6 +110,7 @@ bool SolverProcess::submit(const std::string &path) {
         if (in_flight_) return false;
         in_flight_ = true;
         pending_path_ = path;
+        pending_submitted_at_ = std::chrono::steady_clock::now();
     }
 
     std::string line = path + "\n";
@@ -157,10 +158,20 @@ void SolverProcess::reader_loop() {
             start = i + 1;
             if (line.empty()) continue;
 
-            SolveResult r = parse_result(line);
+            ParsedResult parsed = parse_result(line);
+            auto now = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lock(mu_);
-            latest_ = ResultStamp{r, pending_path_, next_seq_++};
-            in_flight_ = false;
+            ResultStamp rs;
+            rs.result      = parsed.result;
+            rs.frame_path  = pending_path_;
+            rs.seq         = next_seq_++;
+            rs.load_ms     = parsed.load_ms;
+            rs.detect_ms   = parsed.detect_ms;
+            rs.received_at = now;
+            rs.wall_ms     = std::chrono::duration<float, std::milli>(
+                                 now - pending_submitted_at_).count();
+            latest_        = std::move(rs);
+            in_flight_     = false;
             pending_path_.clear();
         }
         if (start > 0) buf.erase(0, start);
@@ -168,21 +179,21 @@ void SolverProcess::reader_loop() {
     running_ = false;
 }
 
-SolveResult SolverProcess::parse_result(const std::string &json) {
-    SolveResult r{};
-    r.solved = json_bool(json, "solved");
-    if (r.solved) {
-        r.ra            = static_cast<float>(json_float(json, "ra_rad"));
-        r.dec           = static_cast<float>(json_float(json, "dec_rad"));
-        r.roll          = static_cast<float>(json_float(json, "roll_rad"));
-        r.fov           = static_cast<float>(json_float(json, "fov_rad"));
-        r.rmse          = static_cast<float>(json_float(json, "rmse"));
-        r.num_matches   = static_cast<int>(json_float(json, "num_matches"));
-        r.solve_time_ms = static_cast<float>(json_float(json, "solve_time_ms"));
-    } else {
-        r.solve_time_ms = static_cast<float>(json_float(json, "solve_time_ms"));
+SolverProcess::ParsedResult SolverProcess::parse_result(const std::string &json) {
+    ParsedResult p;
+    p.result.solved = json_bool(json, "solved");
+    if (p.result.solved) {
+        p.result.ra            = static_cast<float>(json_float(json, "ra_rad"));
+        p.result.dec           = static_cast<float>(json_float(json, "dec_rad"));
+        p.result.roll          = static_cast<float>(json_float(json, "roll_rad"));
+        p.result.fov           = static_cast<float>(json_float(json, "fov_rad"));
+        p.result.rmse          = static_cast<float>(json_float(json, "rmse"));
+        p.result.num_matches   = static_cast<int>(json_float(json, "num_matches"));
     }
-    return r;
+    p.result.solve_time_ms = static_cast<float>(json_float(json, "solve_time_ms"));
+    p.load_ms   = static_cast<float>(json_float(json, "load_ms",   -1.0));
+    p.detect_ms = static_cast<float>(json_float(json, "detect_ms", -1.0));
+    return p;
 }
 
 void SolverProcess::shutdown() {

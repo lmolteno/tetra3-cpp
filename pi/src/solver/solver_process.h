@@ -3,6 +3,7 @@
 #include <tetra3/types.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -28,8 +29,17 @@ public:
 
     struct ResultStamp {
         SolveResult result{};
-        std::string frame_path;       // which frame produced it
+        std::string frame_path;                     // which frame produced it
         std::uint64_t seq = 0;
+        // Stages reported by solve_cli (-1 = absent in this result).
+        float load_ms = -1.0f;
+        float detect_ms = -1.0f;
+        // Wall-clock interval between submit and result-arrived in pi_tracker.
+        // Includes IPC + everything solve_cli did.
+        float wall_ms = 0.0f;
+        // When the result was received (steady_clock). Lets the caller compute
+        // how stale this result is.
+        std::chrono::steady_clock::time_point received_at{};
     };
 
     explicit SolverProcess(Config cfg);
@@ -63,6 +73,7 @@ private:
     mutable std::mutex mu_;
     bool in_flight_ = false;
     std::string pending_path_;
+    std::chrono::steady_clock::time_point pending_submitted_at_{};
     std::optional<ResultStamp> latest_;
     std::uint64_t last_polled_seq_ = 0;
     std::uint64_t next_seq_ = 1;
@@ -70,5 +81,10 @@ private:
     void reader_loop();
     void shutdown();
 
-    static SolveResult parse_result(const std::string &json);
+    struct ParsedResult {
+        SolveResult result{};
+        float load_ms = -1.0f;
+        float detect_ms = -1.0f;
+    };
+    static ParsedResult parse_result(const std::string &json);
 };

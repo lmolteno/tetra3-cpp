@@ -76,6 +76,30 @@ void publish(std::ostream &out, const State &s) {
         out << ",\"frame_path\":\"" << s.frame_path << "\"";
     }
 
+    {
+        const auto &t = s.timing;
+        bool any =
+            t.capture >= 0 || t.archive >= 0 || t.load >= 0 || t.detect >= 0 ||
+            t.match >= 0   || t.solve_wall >= 0 || t.result_age >= 0;
+        if (any) {
+            out << ",\"timing_ms\":{";
+            const char *sep = "";
+            auto emit = [&](const char *k, float v) {
+                if (v < 0) return;
+                out << sep << "\"" << k << "\":" << v;
+                sep = ",";
+            };
+            emit("capture",    t.capture);
+            emit("archive",    t.archive);
+            emit("load",       t.load);
+            emit("detect",     t.detect);
+            emit("match",      t.match);
+            emit("solve_wall", t.solve_wall);
+            emit("result_age", t.result_age);
+            out << "}";
+        }
+    }
+
     if (s.fb && s.fb_size > 0) {
         out << ",\"fb\":\"";
         write_base64(out, s.fb, s.fb_size);
