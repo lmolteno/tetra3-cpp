@@ -50,7 +50,7 @@ _BRAILLE_BIT = [
 ]
 
 
-def render_fb(rows):
+def render_fb_lines(rows):
     out = []
     for y0 in range(0, 64, 4):
         line = []
@@ -68,10 +68,10 @@ def render_fb(rows):
                         bits |= 1 << _BRAILLE_BIT[dy][dx]
             line.append(chr(0x2800 + bits))
         out.append("".join(line))
-    return "\n".join(out)
+    return out
 
 
-def render_status(o):
+def render_status_lines(o):
     parts = [f'mode={o.get("mode", "?")}']
     if o.get("solved"):
         ra = math.degrees(o["ra_rad"])
@@ -117,21 +117,28 @@ def render_status(o):
         bits = [f"{k}={t[k]:.0f}" for k in order if k in t]
         if bits:
             out.append("  timing: " + " ".join(bits))
-    return "\n".join(out)
+    return out
 
 
 # Alternate screen buffer — the viewer redraws in place without polluting
-# the user's terminal scrollback.
+# the user's terminal scrollback. We use absolute cursor positioning per row
+# (no trailing \n's) so a small terminal can't accidentally scroll the alt
+# screen between ticks, and clear-to-EOL on each line so a shorter line
+# doesn't leave residue from the previous tick.
 ENTER_ALT   = "\033[?1049h"
 EXIT_ALT    = "\033[?1049l"
 HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
-HOME        = "\033[H"
+CLEAR_EOL   = "\033[K"
 CLEAR_BELOW = "\033[J"
 
 
+def cursor_to(row, col=1):  # 1-indexed
+    return f"\033[{row};{col}H"
+
+
 def main():
-    sys.stdout.write(ENTER_ALT + HIDE_CURSOR)
+    sys.stdout.write(ENTER_ALT + HIDE_CURSOR + cursor_to(1) + "\033[2J")
     sys.stdout.flush()
     try:
         for line in sys.stdin:
@@ -143,15 +150,25 @@ def main():
             except json.JSONDecodeError:
                 continue
 
-            buf = [HOME]
+            buf = []
+            row = 1
             if "fb" in o:
                 rows = decode_fb(o["fb"])
                 if rows:
-                    buf.append(render_fb(rows))
-                    buf.append("\n")
-            buf.append("\n")
-            buf.append(render_status(o))
-            buf.append("\n")
+                    for fb_line in render_fb_lines(rows):
+                        buf.append(cursor_to(row))
+                        buf.append(fb_line)
+                        buf.append(CLEAR_EOL)
+                        row += 1
+            row += 1  # blank separator
+            for status_line in render_status_lines(o):
+                buf.append(cursor_to(row))
+                buf.append(status_line)
+                buf.append(CLEAR_EOL)
+                row += 1
+            # Clear any rows below the last status line that may have content
+            # from a previous tick (e.g. timing line that's now absent).
+            buf.append(cursor_to(row))
             buf.append(CLEAR_BELOW)
             sys.stdout.write("".join(buf))
             sys.stdout.flush()
