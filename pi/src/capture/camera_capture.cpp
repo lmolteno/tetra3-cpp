@@ -211,7 +211,7 @@ bool LibcameraCapture::initialize() {
     impl->running.store(true);
     impl->thread = std::thread(&LibcameraCapture::capture_thread_main, this);
 
-    std::cout << "Camera initialized: " << stream_config.toString()
+    std::cerr << "Camera initialized: " << stream_config.toString()
               << " (lens=" << initial_lens
               << " exposure_us=" << initial_exposure
               << " gain=" << initial_gain

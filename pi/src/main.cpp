@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -130,6 +131,12 @@ static void on_sigint(int) { g_running = false; }
 
 int main(int argc, char *argv[]) {
     AppConfig cfg = parse_args(argc, argv);
+
+    // Quiet libcamera's INFO / WARN chatter to stderr by default. Otherwise
+    // running over `ssh -tt host "./pi_tracker ..." | view.py` floods the
+    // viewer's stdin (pty merges stderr into stdout under -tt). User can
+    // still override via env if they want the noise.
+    setenv("LIBCAMERA_LOG_LEVELS", "*:ERROR", /*overwrite=*/0);
 
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
