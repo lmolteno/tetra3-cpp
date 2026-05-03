@@ -41,10 +41,14 @@ target_include_directories(pi_tracker PRIVATE src)
 target_link_libraries(pi_tracker PRIVATE tetra3_solver)
 
 # Pi 2 (Cortex-A7) and up have NEON. Alpine's armhf default is vfpv3-d16 with
-# no NEON; flip it on so __ARM_NEON is defined and the SIMD bin loop in
-# capture/camera_capture.cpp actually compiles.
+# no NEON; flip it on so __ARM_NEON is defined and the SIMD paths (the 2x2 bin
+# in capture/, the bilinear mask in solver/star_detector) actually compile.
+set(PI_NEON_ARMHF FALSE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|armv7|armhf)" AND
    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64")
+    set(PI_NEON_ARMHF TRUE)
+endif()
+if(PI_NEON_ARMHF)
     target_compile_options(pi_tracker PRIVATE -mfpu=neon-vfpv4)
 endif()
 
@@ -68,3 +72,6 @@ add_executable(solve_cli
 target_include_directories(solve_cli PRIVATE src)
 target_link_libraries(solve_cli PRIVATE tetra3_solver)
 target_link_options(solve_cli PRIVATE -static)
+if(PI_NEON_ARMHF)
+    target_compile_options(solve_cli PRIVATE -mfpu=neon-vfpv4)
+endif()

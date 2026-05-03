@@ -7,6 +7,10 @@
 #include <numeric>
 #include <stack>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 StarDetector::StarDetector(const StarDetectorConfig &config) : config(config) {}
 
 StarDetector::BackgroundStats StarDetector::estimate_background(const uint16_t *data, int width, int height) {
@@ -176,14 +180,21 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame,
                   << ", stddev=" << std::setprecision(1) << bg_stddev << std::endl;
     }
 
-    // Step 2: Create binary mask using local threshold
-    // Precompute per-tile threshold, then bilinearly interpolate per pixel
+    // Step 2: Create binary mask using local threshold.
+    //
+    // The bilinear thresh(x, y) is piecewise-linear in x once y is fixed —
+    // within a span where (tx0, tx1) don't change it reduces to
+    //   thresh(x) = thresh_at_x + delta * (x - x_start)
+    // both terms constant for the span. We walk each row in tile-aligned
+    // spans and let NEON fill 8 pixels per iter via running-add. The leading
+    // [0, half) and trailing partial spans use delta=0 (clamped fx).
     auto t_mask = clock::now();
     int tile = bg.tile_size;
     int ntiles = static_cast<int>(bg.tile_mean.size());
     int tiles_x = bg.tiles_x;
     int tiles_y = ntiles / tiles_x;
     float half = tile * 0.5f;
+    float inv_tile = 1.0f / tile;
 
     std::vector<float> tile_thresh(ntiles);
     for (int i = 0; i < ntiles; i++)
@@ -191,8 +202,7 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame,
 
     std::vector<uint8_t> mask(width * height, 0);
     for (int y = 0; y < height; y++) {
-        // Tile-center relative coordinate and row indices
-        float fy_raw = (static_cast<float>(y) - half) / tile;
+        float fy_raw = (static_cast<float>(y) - half) * inv_tile;
         int ty0 = std::max(0, static_cast<int>(fy_raw));
         int ty1 = std::min(tiles_y - 1, ty0 + 1);
         float fy = fy_raw - ty0;
@@ -201,20 +211,72 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame,
         int row1 = ty1 * tiles_x;
         float w0y = 1.0f - fy, w1y = fy;
 
-        for (int x = 0; x < width; x++) {
-            float fx_raw = (static_cast<float>(x) - half) / tile;
+        const uint16_t *row_data = data + static_cast<size_t>(y) * width;
+        uint8_t *row_mask = mask.data() + static_cast<size_t>(y) * width;
+
+        int x = 0;
+        while (x < width) {
+            float fx_raw = (static_cast<float>(x) - half) * inv_tile;
             int tx0 = std::max(0, static_cast<int>(fx_raw));
             int tx1 = std::min(tiles_x - 1, tx0 + 1);
-            float fx = fx_raw - tx0;
-            if (fx < 0.0f) fx = 0.0f;
+            bool left_clamp  = (fx_raw < 0.0f);            // x in [0, half)
+            bool right_clamp = (tx0 == tx1);               // last partial span
 
-            float thresh = tile_thresh[row0 + tx0] * (1.0f - fx) * w0y
-                         + tile_thresh[row0 + tx1] * fx * w0y
-                         + tile_thresh[row1 + tx0] * (1.0f - fx) * w1y
-                         + tile_thresh[row1 + tx1] * fx * w1y;
+            int span_end;
+            if (left_clamp) {
+                span_end = std::min(static_cast<int>(half), width);
+            } else if (right_clamp) {
+                span_end = width;
+            } else {
+                span_end = std::min(static_cast<int>((tx0 + 1) * tile + half), width);
+            }
 
-            if (data[y * width + x] > thresh) {
-                mask[y * width + x] = 1;
+            float a = tile_thresh[row0 + tx0];
+            float b = tile_thresh[row0 + tx1];
+            float c = tile_thresh[row1 + tx0];
+            float d = tile_thresh[row1 + tx1];
+
+            float fx_at_x = left_clamp ? 0.0f : (fx_raw - tx0);
+            float thresh_at_x = a*(1.0f - fx_at_x)*w0y + b*fx_at_x*w0y
+                              + c*(1.0f - fx_at_x)*w1y + d*fx_at_x*w1y;
+            float delta = (left_clamp || right_clamp)
+                ? 0.0f
+                : ((b - a) * w0y + (d - c) * w1y) * inv_tile;
+
+#if defined(__ARM_NEON)
+            if (x + 8 <= span_end) {
+                static const float lane_off[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+                float32x4_t base    = vdupq_n_f32(thresh_at_x);
+                float32x4_t delta_v = vdupq_n_f32(delta);
+                float32x4_t step    = vdupq_n_f32(delta * 8.0f);
+                float32x4_t off_lo  = vld1q_f32(lane_off);
+                float32x4_t off_hi  = vld1q_f32(lane_off + 4);
+                float32x4_t thresh_lo = vmlaq_f32(base, delta_v, off_lo);
+                float32x4_t thresh_hi = vmlaq_f32(base, delta_v, off_hi);
+
+                const uint8x8_t one = vdup_n_u8(1);
+                for (; x + 8 <= span_end; x += 8) {
+                    uint16x8_t  d_v  = vld1q_u16(row_data + x);
+                    float32x4_t d_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(d_v)));
+                    float32x4_t d_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(d_v)));
+
+                    uint32x4_t cmp_lo = vcgtq_f32(d_lo, thresh_lo);
+                    uint32x4_t cmp_hi = vcgtq_f32(d_hi, thresh_hi);
+                    uint16x8_t cmp    = vcombine_u16(vmovn_u32(cmp_lo), vmovn_u32(cmp_hi));
+                    uint8x8_t  out    = vand_u8(vmovn_u16(cmp), one);
+                    vst1_u8(row_mask + x, out);
+
+                    thresh_lo = vaddq_f32(thresh_lo, step);
+                    thresh_hi = vaddq_f32(thresh_hi, step);
+                }
+            }
+#endif
+            for (; x < span_end; x++) {
+                float fx_pix = left_clamp ? 0.0f
+                                          : ((static_cast<float>(x) - half) * inv_tile - tx0);
+                float thresh = a*(1.0f - fx_pix)*w0y + b*fx_pix*w0y
+                             + c*(1.0f - fx_pix)*w1y + d*fx_pix*w1y;
+                if (row_data[x] > thresh) row_mask[x] = 1;
             }
         }
     }
