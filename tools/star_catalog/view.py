@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live viewer for pi_tracker NDJSON output.
 
-Renders the 128x64 SH1106 framebuffer to your terminal using Unicode
-half-block characters (so 1 char = 2 vertical pixels) and prints the solve
-state below it.
+Renders the 128x64 SH1106 framebuffer to your terminal as Unicode braille
+(2x4 pixels per char, so 64 cols × 16 rows — fits in any terminal and
+gets the OLED's 2:1 aspect ratio right).
 
 Usage:
     ssh pi './pi_tracker ...' | tools/star_catalog/view.py
@@ -36,19 +36,37 @@ def decode_fb(b64):
     return rows
 
 
-HALF_TOP = "▀"  # ▀
-HALF_BOT = "▄"  # ▄
-FULL = "█"      # █
+# Braille pattern: 2x4 pixels per char, base codepoint U+2800.
+# Bit position by (x_in_block, y_in_block):
+#     (0,0)=0   (1,0)=3
+#     (0,1)=1   (1,1)=4
+#     (0,2)=2   (1,2)=5
+#     (0,3)=6   (1,3)=7
+_BRAILLE_BIT = [
+    [0, 3],
+    [1, 4],
+    [2, 5],
+    [6, 7],
+]
 
 
 def render_fb(rows):
     out = []
-    for y0 in range(0, 64, 2):
+    for y0 in range(0, 64, 4):
         line = []
-        for x in range(128):
-            t = rows[y0][x]
-            b = rows[y0 + 1][x]
-            line.append(FULL if (t and b) else HALF_TOP if t else HALF_BOT if b else " ")
+        for x0 in range(0, 128, 2):
+            bits = 0
+            for dy in range(4):
+                y = y0 + dy
+                if y >= 64:
+                    continue
+                for dx in range(2):
+                    x = x0 + dx
+                    if x >= 128:
+                        continue
+                    if rows[y][x]:
+                        bits |= 1 << _BRAILLE_BIT[dy][dx]
+            line.append(chr(0x2800 + bits))
         out.append("".join(line))
     return "\n".join(out)
 
@@ -98,12 +116,23 @@ def render_status(o):
                  "solve_wall", "result_age"]
         bits = [f"{k}={t[k]:.0f}" for k in order if k in t]
         if bits:
-            out.append("  timing_ms: " + " ".join(bits))
+            out.append("  timing: " + " ".join(bits))
     return "\n".join(out)
 
 
+# Alternate screen buffer — the viewer redraws in place without polluting
+# the user's terminal scrollback.
+ENTER_ALT   = "\033[?1049h"
+EXIT_ALT    = "\033[?1049l"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+HOME        = "\033[H"
+CLEAR_BELOW = "\033[J"
+
+
 def main():
-    sys.stdout.write("\033[2J\033[?25l")  # clear screen, hide cursor
+    sys.stdout.write(ENTER_ALT + HIDE_CURSOR)
+    sys.stdout.flush()
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -114,18 +143,23 @@ def main():
             except json.JSONDecodeError:
                 continue
 
-            sys.stdout.write("\033[H")  # cursor home
+            buf = [HOME]
             if "fb" in o:
                 rows = decode_fb(o["fb"])
                 if rows:
-                    sys.stdout.write(render_fb(rows) + "\n")
-            sys.stdout.write("\n" + render_status(o) + "\n")
-            sys.stdout.write("\033[J")  # clear to end of screen
+                    buf.append(render_fb(rows))
+                    buf.append("\n")
+            buf.append("\n")
+            buf.append(render_status(o))
+            buf.append("\n")
+            buf.append(CLEAR_BELOW)
+            sys.stdout.write("".join(buf))
             sys.stdout.flush()
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write("\033[?25h")  # show cursor
+        sys.stdout.write(SHOW_CURSOR + EXIT_ALT)
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
