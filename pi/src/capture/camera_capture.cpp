@@ -34,9 +34,9 @@ struct LibcameraCapture::Impl : public Object {
     Stream *stream = nullptr;
 
     // FIFO of completed requests pushed by libcamera's worker thread, popped
-    // by capture() on the main thread. We keep all allocated requests queued
+    // by the internal capture thread. We keep all allocated requests queued
     // continuously (re-queued the moment they come back) so the camera always
-    // has work to do — no missed sensor cycles between captures.
+    // has work to do — no missed sensor cycles between consumer reads.
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<Request *> completed;
@@ -48,6 +48,17 @@ struct LibcameraCapture::Impl : public Object {
     float    applied_lens        = std::nanf("");
     uint32_t applied_exposure_us = 0;
     float    applied_gain        = std::nanf("");
+
+    // Internal capture thread: continuously consumes completed requests, runs
+    // 2x2 bin, and stashes the most recent Frame in the mailbox. capture() is
+    // a non-blocking poll on this mailbox.
+    std::thread thread;
+    std::atomic<bool> running{false};
+
+    std::mutex mailbox_mu;
+    std::optional<Frame> latest;
+    std::uint64_t latest_seq = 0;
+    std::uint64_t consumed_seq = 0;
 
     void on_request_completed(Request *request) {
         {
@@ -62,6 +73,13 @@ LibcameraCapture::LibcameraCapture(int width, int height)
     : req_width(width), req_height(height), impl(std::make_unique<Impl>()) {}
 
 LibcameraCapture::~LibcameraCapture() {
+    // Stop the capture thread first so it isn't trying to use camera/buffers
+    // while libcamera is tearing them down.
+    if (impl->running.load()) {
+        impl->running.store(false);
+        impl->cv.notify_all();
+        if (impl->thread.joinable()) impl->thread.join();
+    }
     if (impl->camera) {
         impl->camera->stop();
         impl->camera->release();
@@ -180,11 +198,18 @@ bool LibcameraCapture::initialize() {
     impl->applied_gain        = initial_gain;
 
     // Pre-fill the pipeline. Every allocated request is queued up front so
-    // the camera always has frames in flight. As each one completes, capture()
-    // re-queues it.
+    // the camera always has frames in flight. As each one completes, the
+    // capture thread re-queues it.
     for (auto &req : impl->requests) {
         impl->camera->queueRequest(req.get());
     }
+
+    // Spawn the internal capture thread. It runs wait+bin continuously and
+    // stashes the most recent Frame in the mailbox; capture() polls that
+    // mailbox without blocking on libcamera.
+    last_request_pop_ = std::chrono::steady_clock::now();
+    impl->running.store(true);
+    impl->thread = std::thread(&LibcameraCapture::capture_thread_main, this);
 
     std::cout << "Camera initialized: " << stream_config.toString()
               << " (lens=" << initial_lens
@@ -198,26 +223,46 @@ void LibcameraCapture::set_lens_position(float diopters) { lens_position_.store(
 void LibcameraCapture::set_exposure_us(uint32_t us)      { exposure_us_.store(us); }
 void LibcameraCapture::set_gain(float multiplier)        { gain_.store(multiplier); }
 
-std::optional<Frame> LibcameraCapture::capture() {
-    if (!impl->camera || impl->requests.empty()) return std::nullopt;
-
-    using clock = std::chrono::steady_clock;
-    auto t_wait = clock::now();
-
-    // Block until the next frame comes back from the pipeline.
-    Request *req = nullptr;
-    {
-        std::unique_lock<std::mutex> lock(impl->mtx);
-        impl->cv.wait(lock, [&]{ return !impl->completed.empty(); });
-        req = impl->completed.front();
-        impl->completed.pop_front();
+namespace {
+// 2x2 reduce a row range. Each thread gets its own [y0, y1) strip; reads
+// come from a shared mmap'd buffer, writes go to non-overlapping ranges of
+// out_buf, so no synchronisation is needed inside the parallel region.
+void bin_rows(const uint8_t *bytes, unsigned int stride, int out_width,
+              uint16_t *out_buf, int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
+        int by = y * 2;
+        const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
+        const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
+        uint16_t *out = out_buf + static_cast<size_t>(y) * out_width;
+        int x = 0;
+#if defined(__ARM_NEON)
+        for (; x + 8 <= out_width; x += 8) {
+            uint16x8x2_t r0 = vld2q_u16(row0 + x * 2);
+            uint16x8x2_t r1 = vld2q_u16(row1 + x * 2);
+            uint16x8_t s0  = vaddq_u16(r0.val[0], r0.val[1]);
+            uint16x8_t s1  = vaddq_u16(r1.val[0], r1.val[1]);
+            uint16x8_t avg = vshrq_n_u16(vaddq_u16(s0, s1), 2);
+            vst1q_u16(out + x, avg);
+        }
+#endif
+        for (; x < out_width; x++) {
+            int bx = x * 2;
+            uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
+            out[x] = static_cast<uint16_t>(sum >> 2);
+        }
     }
-    last_wait_ms_.store(
-        std::chrono::duration<float, std::milli>(clock::now() - t_wait).count());
+}
+}
 
-    // Re-arm the request: reset, write only the controls whose desired value
-    // differs from the last applied (Pi's IPA treats every control-on-request
-    // as a change-signal and lags the next ~2 frames if anything is set).
+void LibcameraCapture::capture_thread_main() {
+    using clock = std::chrono::steady_clock;
+    const StreamConfiguration &sc = impl->config->at(0);
+    const int raw_width  = sc.size.width;
+    const int raw_height = sc.size.height;
+    const unsigned int stride = sc.stride;
+    const int out_width  = raw_width  / 2;
+    const int out_height = raw_height / 2;
+
     auto requeue = [&](Request *r) {
         r->reuse(Request::ReuseBuffers);
         auto &rc = r->controls();
@@ -232,8 +277,6 @@ std::optional<Frame> LibcameraCapture::capture() {
         }
         if (new_exp_us != impl->applied_exposure_us) {
             rc.set(controls::ExposureTime, static_cast<int32_t>(new_exp_us));
-            // Frame duration must accommodate the exposure or the pipeline
-            // clamps it. Pin both ends to the exposure time.
             const std::array<int64_t, 2> fdur = { new_exp_us, new_exp_us };
             rc.set(controls::FrameDurationLimits, Span<const int64_t, 2>(fdur));
             impl->applied_exposure_us = new_exp_us;
@@ -242,109 +285,107 @@ std::optional<Frame> LibcameraCapture::capture() {
             rc.set(controls::AnalogueGain, new_gain);
             impl->applied_gain = new_gain;
         }
-
         impl->camera->queueRequest(r);
     };
 
-    if (req->status() != Request::RequestComplete) {
-        std::cerr << "Request failed (status=" << static_cast<int>(req->status()) << ")" << std::endl;
+    while (impl->running.load()) {
+        Request *req = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(impl->mtx);
+            // Time-bounded wait so we re-check `running` and can shut down.
+            impl->cv.wait_for(lock, std::chrono::milliseconds(100), [&]{
+                return !impl->completed.empty() || !impl->running.load();
+            });
+            if (!impl->running.load()) return;
+            if (impl->completed.empty()) continue;
+            auto t_wait_ms =
+                std::chrono::duration<float, std::milli>(clock::now() - last_request_pop_).count();
+            last_wait_ms_.store(t_wait_ms);
+            last_request_pop_ = clock::now();
+            req = impl->completed.front();
+            impl->completed.pop_front();
+        }
+
+        if (req->status() != Request::RequestComplete) {
+            std::cerr << "Request failed (status=" << static_cast<int>(req->status()) << ")" << std::endl;
+            requeue(req);
+            continue;
+        }
+
+        const auto &buffers = req->buffers();
+        auto it = buffers.find(impl->stream);
+        if (it == buffers.end()) { requeue(req); continue; }
+        FrameBuffer *buffer = it->second;
+        const auto &planes = buffer->planes();
+        if (planes.empty()) { requeue(req); continue; }
+
+        void *data = mmap(nullptr, planes[0].length, PROT_READ, MAP_SHARED,
+                          planes[0].fd.get(), planes[0].offset);
+        if (data == MAP_FAILED) {
+            std::cerr << "Failed to mmap buffer" << std::endl;
+            requeue(req);
+            continue;
+        }
+
+        Frame frame;
+        frame.width = out_width;
+        frame.height = out_height;
+        frame.bit_depth = 10;
+        frame.data.resize(static_cast<size_t>(out_width) * out_height);
+
+        auto t_bin = clock::now();
+        const uint8_t *bytes   = static_cast<const uint8_t *>(data);
+        uint16_t      *out_buf = frame.data.data();
+
+        // Pi 2 (and every newer Pi) has 4 cores. Spawn N-1 workers and run the
+        // last strip on this thread. std::thread create+join is ~few hundred
+        // us — negligible against the ms-scale work.
+        unsigned hwc = std::thread::hardware_concurrency();
+        int n_threads = (hwc == 0) ? 1 : std::min(4u, hwc);
+        if (n_threads <= 1 || out_height < 32) {
+            bin_rows(bytes, stride, out_width, out_buf, 0, out_height);
+        } else {
+            const int rows_per = (out_height + n_threads - 1) / n_threads;
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads - 1);
+            for (int t = 0; t < n_threads - 1; t++) {
+                int y0 = t * rows_per;
+                int y1 = std::min((t + 1) * rows_per, out_height);
+                if (y0 >= y1) break;
+                workers.emplace_back(bin_rows, bytes, stride, out_width, out_buf, y0, y1);
+            }
+            bin_rows(bytes, stride, out_width, out_buf,
+                     (n_threads - 1) * rows_per, out_height);
+            for (auto &w : workers) w.join();
+        }
+        last_bin_ms_.store(
+            std::chrono::duration<float, std::milli>(clock::now() - t_bin).count());
+
+        munmap(data, planes[0].length);
+
+        // Drop the previous unread frame if the consumer hasn't picked it up;
+        // we only ever keep the latest. This is the structural fix that lets
+        // capture() be a fast non-blocking poll while the camera runs at its
+        // own rate.
+        {
+            std::lock_guard<std::mutex> lock(impl->mailbox_mu);
+            impl->latest = std::move(frame);
+            impl->latest_seq++;
+        }
+
         requeue(req);
+    }
+}
+
+std::optional<Frame> LibcameraCapture::capture() {
+    std::lock_guard<std::mutex> lock(impl->mailbox_mu);
+    if (!impl->latest || impl->latest_seq == impl->consumed_seq) {
         return std::nullopt;
     }
-
-    const auto &buffers = req->buffers();
-    auto it = buffers.find(impl->stream);
-    if (it == buffers.end()) { requeue(req); return std::nullopt; }
-
-    FrameBuffer *buffer = it->second;
-    const auto &planes = buffer->planes();
-    if (planes.empty()) { requeue(req); return std::nullopt; }
-
-    void *data = mmap(nullptr, planes[0].length, PROT_READ, MAP_SHARED,
-                      planes[0].fd.get(), planes[0].offset);
-    if (data == MAP_FAILED) {
-        std::cerr << "Failed to mmap buffer" << std::endl;
-        requeue(req);
-        return std::nullopt;
-    }
-
-    // 2x2-bin the Bayer mosaic into grayscale. With SBGGR10 each pixel is one
-    // uint16; libcamera reports the row stride in bytes (may be padded), so we
-    // index rows by stride and reinterpret each row as uint16_t*.
-    const StreamConfiguration &sc = impl->config->at(0);
-    int raw_width  = sc.size.width;
-    int raw_height = sc.size.height;
-    unsigned int stride = sc.stride;
-    int out_width  = raw_width  / 2;
-    int out_height = raw_height / 2;
-
-    Frame frame;
-    frame.width = out_width;
-    frame.height = out_height;
-    frame.bit_depth = 10;
-    frame.data.resize(static_cast<size_t>(out_width) * out_height);
-
-    auto t_bin = clock::now();
-    const uint8_t *bytes  = static_cast<const uint8_t *>(data);
-    uint16_t      *out_buf = frame.data.data();
-
-    // 2x2 reduce a row range. Each thread gets its own [y0, y1) strip; reads
-    // are from a shared mmap'd buffer, writes go to non-overlapping ranges of
-    // out_buf, so no synchronisation is needed inside the parallel region.
-    auto bin_rows = [bytes, stride, out_width, out_buf](int y0, int y1) {
-        for (int y = y0; y < y1; y++) {
-            int by = y * 2;
-            const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
-            const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
-            uint16_t *out = out_buf + static_cast<size_t>(y) * out_width;
-            int x = 0;
-#if defined(__ARM_NEON)
-            // 8 output pixels per iter. With 10-bit input, sum of 4 fits in
-            // 16 bits (max 4*1023 = 4092) so we stay in u16 throughout.
-            for (; x + 8 <= out_width; x += 8) {
-                uint16x8x2_t r0 = vld2q_u16(row0 + x * 2);
-                uint16x8x2_t r1 = vld2q_u16(row1 + x * 2);
-                uint16x8_t s0  = vaddq_u16(r0.val[0], r0.val[1]);
-                uint16x8_t s1  = vaddq_u16(r1.val[0], r1.val[1]);
-                uint16x8_t avg = vshrq_n_u16(vaddq_u16(s0, s1), 2);
-                vst1q_u16(out + x, avg);
-            }
-#endif
-            for (; x < out_width; x++) {
-                int bx = x * 2;
-                uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
-                out[x] = static_cast<uint16_t>(sum >> 2);
-            }
-        }
-    };
-
-    // Pi 2 (and every newer Pi) has 4 cores. Spawn N-1 workers and run the
-    // last strip on this thread. std::thread create+join is ~few hundred us
-    // total — negligible against the ~100 ms+ of work being done.
-    unsigned hwc = std::thread::hardware_concurrency();
-    int n_threads = (hwc == 0) ? 1 : std::min(4u, hwc);
-    if (n_threads <= 1 || out_height < 32) {
-        bin_rows(0, out_height);
-    } else {
-        const int rows_per = (out_height + n_threads - 1) / n_threads;
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads - 1);
-        for (int t = 0; t < n_threads - 1; t++) {
-            int y0 = t * rows_per;
-            int y1 = std::min((t + 1) * rows_per, out_height);
-            if (y0 >= y1) break;
-            workers.emplace_back(bin_rows, y0, y1);
-        }
-        bin_rows((n_threads - 1) * rows_per, out_height);
-        for (auto &w : workers) w.join();
-    }
-    last_bin_ms_.store(
-        std::chrono::duration<float, std::milli>(clock::now() - t_bin).count());
-
-    munmap(data, planes[0].length);
-
-    requeue(req);
-    return frame;
+    impl->consumed_seq = impl->latest_seq;
+    Frame f = std::move(*impl->latest);
+    impl->latest.reset();
+    return f;
 }
 
 #endif // HAS_LIBCAMERA

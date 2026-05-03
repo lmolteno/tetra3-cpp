@@ -202,8 +202,10 @@ int main(int argc, char *argv[]) {
     SolveResult last_result{};
     last_result.solved = false;
     std::string last_frame_path;
+    std::string last_archived_path;
     json_sink::Timing last_solve_timing;          // load/detect/match/solve_wall from latest result
     std::chrono::steady_clock::time_point last_result_at{};
+    std::chrono::steady_clock::time_point last_frame_at{};
 
     auto now_steady = []() {
         return std::chrono::duration<double>(
@@ -259,7 +261,10 @@ int main(int argc, char *argv[]) {
             return std::chrono::duration<float, std::milli>(clock::now() - t).count();
         };
 
-        // 2. Capture a frame.
+        // 2. Try to grab a fresh frame. capture() is non-blocking now — the
+        //    libcamera path runs an internal capture thread and returns the
+        //    most recent unread frame, or nullopt if nothing new since last
+        //    call. Image-source returns the loaded frame each call.
         auto t_capture = clock::now();
         auto frame = source->capture();
         float capture_ms = ms_since(t_capture);
@@ -270,9 +275,13 @@ int main(int argc, char *argv[]) {
             auto t_archive = clock::now();
             frame_path = writer.write(*frame);
             archive_ms = ms_since(t_archive);
+            if (!frame_path.empty()) {
+                last_archived_path = frame_path;
+                last_frame_at = clock::now();
+            }
         }
 
-        // 3. Submit to the solver if it's free.
+        // 3. Submit to the solver if we have a new frame and it's free.
         if (frame && solver && !frame_path.empty()) {
             solver->submit(frame_path);
         }
@@ -298,12 +307,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // 5. Render + publish.
-        if (!frame) {
-            view.render_status(canvas, "Capture fail");
-        } else {
-            view.render(canvas, mode, last_result, aligner);
-        }
+        // 5. Render + publish. We render every tick (even if no fresh frame
+        //    arrived) so commands and solver results show up at publish rate.
+        view.render(canvas, mode, last_result, aligner);
 
         json_sink::State s;
         fill_state(s);
@@ -311,7 +317,10 @@ int main(int argc, char *argv[]) {
         s.pa_samples = aligner.num_samples();
         s.pole = aligner.estimate_pole();
         s.offset = aligner.pole_error(s.pole);
-        s.frame_path = frame_path.empty() ? last_frame_path : frame_path;
+        // Always point at the most recently archived frame so the web UI can
+        // render even on stale ticks.
+        s.frame_path = frame_path.empty() ? last_archived_path : frame_path;
+        if (s.frame_path.empty()) s.frame_path = last_frame_path;
         s.timing = last_solve_timing;
         s.timing.capture = capture_ms;
         s.timing.archive = archive_ms;
@@ -319,6 +328,9 @@ int main(int argc, char *argv[]) {
             s.timing.wait = cam->last_wait_ms();
             s.timing.bin  = cam->last_bin_ms();
         });
+        if (last_frame_at != clock::time_point{}) {
+            s.timing.frame_age = ms_since(last_frame_at);
+        }
         if (last_result_at != clock::time_point{}) {
             s.timing.result_age = ms_since(last_result_at);
         }

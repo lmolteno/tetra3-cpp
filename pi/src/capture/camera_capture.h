@@ -4,6 +4,7 @@
 
 #include "capture/frame_source.h"
 #include <atomic>
+#include <chrono>
 #include <memory>
 
 class LibcameraCapture : public IFrameSource {
@@ -25,9 +26,10 @@ public:
     uint32_t exposure_us()   const { return exposure_us_.load();   }
     float    gain()          const { return gain_.load();          }
 
-    // Per-call breakdown of the most recent capture(): wait_ms is the time
-    // blocked on libcamera (i.e. exposure + readout + ISP), bin_ms is the
-    // 2x2 Bayer averaging in software. -1 if not yet measured.
+    // Per-frame breakdown of the most recent frame produced by the internal
+    // capture thread: wait_ms is the time the thread sat blocked on
+    // libcamera (i.e. exposure + readout + ISP, modulo our queue depth),
+    // bin_ms is the 2x2 Bayer averaging in software. -1 if not yet measured.
     float last_wait_ms() const { return last_wait_ms_.load(); }
     float last_bin_ms()  const { return last_bin_ms_.load();  }
 
@@ -38,6 +40,11 @@ private:
     std::atomic<float>    gain_{1.0f};
     std::atomic<float>    last_wait_ms_{-1.0f};
     std::atomic<float>    last_bin_ms_{-1.0f};
+
+    // Used by capture_thread_main() to compute wait_ms between request pops.
+    std::chrono::steady_clock::time_point last_request_pop_{};
+
+    void capture_thread_main();
 
     struct Impl;
     std::unique_ptr<Impl> impl;

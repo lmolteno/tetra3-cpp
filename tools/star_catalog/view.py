@@ -93,7 +93,7 @@ def render_status(o):
         parts.append(o["frame_path"])
     out = ["  ".join(parts)]
     if t := o.get("timing_ms"):
-        order = ["capture", "wait", "bin", "archive", "load",
+        order = ["capture", "wait", "bin", "frame_age", "archive", "load",
                  "detect", "bg", "mask", "cluster", "match",
                  "solve_wall", "result_age"]
         bits = [f"{k}={t[k]:.0f}" for k in order if k in t]

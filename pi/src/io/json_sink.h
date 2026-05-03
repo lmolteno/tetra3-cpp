@@ -19,9 +19,10 @@ namespace json_sink {
 // submit→result-arrived wall clock; result_age is how stale the displayed
 // result is at publish time.
 struct Timing {
-    float capture     = -1.0f;
-    float wait        = -1.0f;   // libcamera (capture sub-stage): exposure + readout + ISP
-    float bin         = -1.0f;   // 2x2 Bayer averaging (capture sub-stage)
+    float capture     = -1.0f;   // main-thread mailbox poll cost (was wait+bin pre-decouple)
+    float wait        = -1.0f;   // capture thread: time between completed requests
+    float bin         = -1.0f;   // capture thread: 2x2 Bayer averaging
+    float frame_age   = -1.0f;   // age of the displayed frame at publish time
     float archive     = -1.0f;
     float load        = -1.0f;
     float detect      = -1.0f;

@@ -92,6 +92,7 @@ void publish(std::ostream &out, const State &s) {
             emit("capture",    t.capture);
             emit("wait",       t.wait);
             emit("bin",        t.bin);
+            emit("frame_age",  t.frame_age);
             emit("archive",    t.archive);
             emit("load",       t.load);
             emit("detect",     t.detect);
