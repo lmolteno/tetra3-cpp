@@ -22,7 +22,8 @@
 static void solve_image(const std::string &image_path,
                         SimpleStarSolver &solver,
                         float fov, float detection_sigma, int crop_size,
-                        int bg_tile_size, bool debug) {
+                        int bg_tile_size, int max_cluster_size,
+                        float min_sharpness, bool debug) {
     using clock = std::chrono::steady_clock;
     auto ms_since = [](clock::time_point t) {
         return std::chrono::duration<double, std::milli>(clock::now() - t).count();
@@ -49,6 +50,8 @@ static void solve_image(const std::string &image_path,
     StarDetectorConfig det_cfg;
     det_cfg.detection_sigma = detection_sigma;
     det_cfg.bg_tile_size = bg_tile_size;
+    det_cfg.max_cluster_size = max_cluster_size;
+    det_cfg.min_sharpness = min_sharpness;
     det_cfg.verbose = debug;
     StarDetector detector(det_cfg);
 
@@ -170,10 +173,12 @@ int main(int argc, char *argv[]) {
     std::string image_path;
     std::string db_stars = "../tetra3_db_stars.bin";
     std::string db_patterns = "../tetra3_db_patterns.bin";
-    float fov = 11.0f;
+    float fov = 70.0f;
     float detection_sigma = 5.0f;
     int crop_size = 720;
     int bg_tile_size = 128;
+    int max_cluster_size = 30;
+    float min_sharpness = 2.0f;
     bool batch_mode = false;
     bool debug = false;
 
@@ -191,6 +196,10 @@ int main(int argc, char *argv[]) {
             crop_size = std::stoi(argv[++i]);
         } else if (arg == "--bg-tile" && i + 1 < argc) {
             bg_tile_size = std::stoi(argv[++i]);
+        } else if (arg == "--max-cluster" && i + 1 < argc) {
+            max_cluster_size = std::stoi(argv[++i]);
+        } else if (arg == "--min-sharpness" && i + 1 < argc) {
+            min_sharpness = std::stof(argv[++i]);
         } else if (arg == "--batch") {
             batch_mode = true;
         } else if (arg == "--debug") {
@@ -224,10 +233,12 @@ int main(int argc, char *argv[]) {
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
                 line.pop_back();
             if (line.empty()) continue;
-            solve_image(line, solver, fov, detection_sigma, crop_size, bg_tile_size, debug);
+            solve_image(line, solver, fov, detection_sigma, crop_size, bg_tile_size,
+                        max_cluster_size, min_sharpness, debug);
         }
     } else {
-        solve_image(image_path, solver, fov, detection_sigma, crop_size, bg_tile_size, debug);
+        solve_image(image_path, solver, fov, detection_sigma, crop_size, bg_tile_size,
+                    max_cluster_size, min_sharpness, debug);
     }
 
     return 0;

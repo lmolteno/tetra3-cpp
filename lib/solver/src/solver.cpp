@@ -1,4 +1,17 @@
 #include <tetra3/solver.h>
+#include <cstdlib>
+
+namespace {
+// Set TETRA3_DEBUG=1 in the environment to print a per-call funnel summary
+// (combos tried, hash hits, ratio matches, binomial passes).
+inline bool debug_enabled() {
+    static const bool on = []{
+        const char *v = std::getenv("TETRA3_DEBUG");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+}
 
 std::vector<uint64_t> SimpleStarSolver::calculate_powers(int base, unsigned long count) {
     std::vector<uint64_t> powers(count);
@@ -436,6 +449,23 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     int num_extracted_stars_raw = centroids.size();
     int max_stars_to_check = std::min(num_extracted_stars_raw, pattern_checking_stars);
 
+    // Debug funnel counters.
+    long long dbg_combos = 0, dbg_hash_probes = 0, dbg_pattern_hits = 0;
+    long long dbg_ratio_match = 0, dbg_fov_reject = 0;
+    long long dbg_binomial_eval = 0, dbg_binomial_pass = 0;
+    long double dbg_best_prob = 1.0L;
+    int dbg_best_matches = 0;
+    if (debug_enabled()) {
+        std::cerr << "[tetra3] solve start: centroids=" << num_extracted_stars_raw
+                  << " checking=" << max_stars_to_check
+                  << " fov_est=" << fov_estimate_deg << "deg"
+                  << " fov_max_err=" << fov_max_error_deg << "deg"
+                  << " match_radius=" << match_radius
+                  << " match_threshold=" << match_threshold
+                  << " image=" << width << "x" << height
+                  << "\n";
+    }
+
     // Pre-compute star vectors for pattern-checking stars (avoids redundant work per combo)
     // Use undistorted centroids so distortion correction actually affects pattern matching
     std::vector<std::array<double, 3>> precomputed_vectors;
@@ -457,6 +487,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
         for (int j = i + 1; j < max_stars_to_check - 2; j++) {
             for (int k = j + 1; k < max_stars_to_check - 1; k++) {
                 for (int l = k + 1; l < max_stars_to_check; l++) {
+                    dbg_combos++;
                     fov = fov_initial; // Reset for each pattern attempt
                     // Compute 6 edge angles from precomputed vectors
                     const auto &vi = precomputed_vectors[i];
@@ -502,6 +533,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                         // Inline hash probing (avoids vector allocation)
                         uint64_t hash_index = hash_buf[hi];
                         for (uint64_t probe = 0; probe < table_size && probe <= 1000; probe++) {
+                            dbg_hash_probes++;
                             uint64_t probed_index = (hash_index + probe * probe) % table_size;
                             const auto &catalog_pattern = pattern_catalog[probed_index];
 
@@ -510,6 +542,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                 if (catalog_pattern.star_indices[x] != 0) { is_empty = false; break; }
                             }
                             if (is_empty) break;
+                            dbg_pattern_hits++;
 
                             // Build catalog vectors
                             std::array<std::array<double, 3>, 4> cat_v;
@@ -536,6 +569,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                             }
 
                             if (match) {
+                                dbg_ratio_match++;
                                 float catalog_largest_edge_val = 0;
                                 for (int p = 0; p < 4; p++)
                                     for (int q = p + 1; q < 4; q++) {
@@ -547,6 +581,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                     double new_fov = catalog_largest_edge_val / largest_edge * fov_initial;
                                     if (fov_max_error_rad > 0 &&
                                         std::abs(new_fov - fov_estimate_deg * M_PI / 180.0) > fov_max_error_rad) {
+                                        dbg_fov_reject++;
                                         continue;
                                     }
                                     fov = new_fov;
@@ -638,6 +673,119 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                 std::vector<std::array<int, 2>> matched_stars = _find_centroid_matches(
                                     image_centroids_undist, nearby_star_centroids, match_radius_pixels);
 
+                                // === Iterative re-projection refinement ===
+                                // Refit rotation from current matches, re-project all nearby
+                                // catalog stars, re-match. Repeat until match count stabilizes.
+                                // A real solve grows monotonically here (4 -> 7 -> 10); a
+                                // spurious one stays flat or shrinks.
+                                int prev_matches = -1;
+                                const int max_refine_iter = 5;
+                                for (int rit = 0; rit < max_refine_iter; rit++) {
+                                    int curr = static_cast<int>(matched_stars.size());
+                                    if (curr == prev_matches) break;
+                                    if (curr < 4) break;
+                                    prev_matches = curr;
+
+                                    // Refit R from latest matches
+                                    std::vector<Centroid> img_c;
+                                    std::vector<std::array<double, 3>> cat_v;
+                                    img_c.reserve(curr); cat_v.reserve(curr);
+                                    for (const auto &mp : matched_stars) {
+                                        img_c.push_back(image_centroids_undist[mp[0]]);
+                                        cat_v.push_back(nearby_star_vectors[mp[1]]);
+                                    }
+                                    auto img_v = compute_vectors(img_c, height, width, fov);
+
+                                    // Refit FOV from catalog/image angle ratios across
+                                    // all matched pairs. Averages out the noise the
+                                    // initial single-pattern FOV estimate carried.
+                                    if (img_v.size() >= 2) {
+                                        double ratio_sum = 0.0;
+                                        int ratio_n = 0;
+                                        for (size_t a = 0; a < img_v.size(); a++) {
+                                            for (size_t b = a + 1; b < img_v.size(); b++) {
+                                                double img_ang = vector_angle(img_v[a], img_v[b]);
+                                                double cat_ang = vector_angle(cat_v[a], cat_v[b]);
+                                                if (img_ang > 1e-9) {
+                                                    ratio_sum += cat_ang / img_ang;
+                                                    ratio_n++;
+                                                }
+                                            }
+                                        }
+                                        if (ratio_n > 0) {
+                                            double new_fov = fov * (ratio_sum / ratio_n);
+                                            // Recompute image vectors at refined FOV so R
+                                            // is fit at consistent scale.
+                                            if (std::abs(new_fov - fov) > 1e-6) {
+                                                fov = new_fov;
+                                                img_v = compute_vectors(img_c, height, width, fov);
+                                            }
+                                        }
+                                    }
+
+                                    auto rot = find_rotation_matrix(img_v, cat_v);
+                                    for (int rr = 0; rr < 3; rr++)
+                                        for (int cc = 0; cc < 3; cc++)
+                                            rotation_matrix_eigen(rr, cc) = rot[rr][cc];
+
+                                    // Search radius depends on FOV — refresh it
+                                    float fov_diag_rad = fov * std::sqrt(
+                                        static_cast<float>(width) * width +
+                                        static_cast<float>(height) * height) /
+                                        static_cast<float>(width);
+                                    search_radius_rad = fov_diag_rad / 2.0f;
+
+                                    // Re-find nearby catalog stars with the new boresight
+                                    std::array<float, 3> bs = {
+                                        rotation_matrix_eigen(0, 0),
+                                        rotation_matrix_eigen(0, 1),
+                                        rotation_matrix_eigen(0, 2)};
+                                    auto new_inds = get_nearby_stars(bs, search_radius_rad);
+                                    std::vector<std::array<double, 3>> new_vecs;
+                                    new_vecs.reserve(new_inds.size());
+                                    for (int idx : new_inds) {
+                                        if (static_cast<size_t>(idx) < star_catalog.size()) {
+                                            const auto &star = star_catalog[idx];
+                                            new_vecs.push_back({star.x, star.y, star.z});
+                                        }
+                                    }
+                                    if (new_vecs.empty()) break;
+
+                                    Eigen::MatrixXf nve(new_vecs.size(), 3);
+                                    for (size_t r = 0; r < new_vecs.size(); r++)
+                                        for (int c = 0; c < 3; c++) nve(r, c) = new_vecs[r][c];
+                                    Eigen::MatrixXf nde = (rotation_matrix_eigen * nve.transpose()).transpose();
+                                    std::vector<std::array<float, 3>> nde_std(nde.rows());
+                                    for (int r = 0; r < nde.rows(); r++)
+                                        for (int c = 0; c < 3; c++) nde_std[r][c] = nde(r, c);
+
+                                    auto pair2 = _compute_centroids_from_vectors(nde_std, height, width, fov);
+                                    auto &new_centroids = pair2.first;
+                                    const auto &new_kept = pair2.second;
+
+                                    std::vector<std::array<double, 3>> kept_vecs;
+                                    std::vector<int> kept_inds;
+                                    for (size_t idx = 0; idx < new_kept.size(); idx++) {
+                                        if (new_kept[idx]) {
+                                            kept_vecs.push_back(new_vecs[idx]);
+                                            kept_inds.push_back(new_inds[idx]);
+                                        }
+                                    }
+
+                                    int nimg = static_cast<int>(image_centroids_undist.size());
+                                    if (static_cast<int>(new_centroids.size()) > nimg) {
+                                        new_centroids.resize(nimg);
+                                        kept_vecs.resize(nimg);
+                                        kept_inds.resize(nimg);
+                                    }
+
+                                    nearby_star_vectors = std::move(kept_vecs);
+                                    nearby_star_inds    = std::move(kept_inds);
+                                    nearby_star_centroids = std::move(new_centroids);
+                                    matched_stars = _find_centroid_matches(
+                                        image_centroids_undist, nearby_star_centroids, match_radius_pixels);
+                                }
+
                                 float boresight_x = rotation_matrix_eigen(0, 0);
                                 float boresight_y = rotation_matrix_eigen(1, 0);
                                 float boresight_z = rotation_matrix_eigen(2, 0);
@@ -665,8 +813,32 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                 long double p_binom = 1.0L - prob_single_star_mismatch;
 
                                 long double prob_mismatch = calculate_binomial_cdf(k_binom, n_binom, p_binom);
+                                dbg_binomial_eval++;
 
-                                if (prob_mismatch < match_threshold) {
+                                // Require enough matches to trust the solve. Spurious solves
+                                // typically plateau at ~4 matches even after refinement;
+                                // real solves grow well past this floor.
+                                int min_matches = std::max(
+                                    6, static_cast<int>(0.3 * num_extracted_stars));
+
+                                if (debug_enabled() &&
+                                    (num_star_matches > dbg_best_matches ||
+                                     (num_star_matches == dbg_best_matches && prob_mismatch < dbg_best_prob))) {
+                                    dbg_best_matches = num_star_matches;
+                                    dbg_best_prob = prob_mismatch;
+                                    std::cerr << "[tetra3]   combo (" << i << "," << j << "," << k << "," << l
+                                              << ") matches=" << num_star_matches
+                                              << "/" << num_extracted_stars
+                                              << " (min=" << min_matches << ")"
+                                              << " nearby=" << num_nearby_catalog_stars
+                                              << " fov=" << fov * 180.0 / M_PI << "deg"
+                                              << " prob_mismatch=" << static_cast<double>(prob_mismatch)
+                                              << "\n";
+                                }
+
+                                if (prob_mismatch < match_threshold &&
+                                    num_star_matches >= min_matches) {
+                                    dbg_binomial_pass++;
 
                                     std::vector<Centroid> matched_image_centroids;
                                     matched_image_centroids.reserve(num_star_matches);
@@ -910,6 +1082,19 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> solve_time = end_time - start_time;
     result.solve_time_ms = solve_time.count();
+    if (debug_enabled()) {
+        std::cerr << "[tetra3] solve FAILED after " << solve_time.count() << "ms"
+                  << "\n  combos_tried     = " << dbg_combos
+                  << "\n  hash_probes      = " << dbg_hash_probes
+                  << "\n  pattern_hits     = " << dbg_pattern_hits
+                  << "\n  edge_ratio_match = " << dbg_ratio_match
+                  << "\n  fov_rejected     = " << dbg_fov_reject
+                  << "\n  binomial_eval    = " << dbg_binomial_eval
+                  << "\n  binomial_pass    = " << dbg_binomial_pass
+                  << "\n  best_match_count = " << dbg_best_matches
+                  << "\n  best_prob        = " << static_cast<double>(dbg_best_prob)
+                  << "\n";
+    }
     return result;
 }
 

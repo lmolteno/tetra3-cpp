@@ -336,6 +336,40 @@ std::vector<DetectedStar> StarDetector::detect(const Frame &frame,
                 double cy = sum_iy / sum_i;
                 double cx = sum_ix / sum_i;
 
+                // Reject diffuse clusters: a sharply peaked source has a peak
+                // value well above the surrounding 7x7 ring; smoothly bright
+                // structures (rooftops, cloud edges) do not.
+                if (config.min_sharpness > 0.0f) {
+                    int yi = static_cast<int>(std::round(cy));
+                    int xi = static_cast<int>(std::round(cx));
+                    int oy0 = std::max(0, yi - 3), oy1 = std::min(height, yi + 4);
+                    int ox0 = std::max(0, xi - 3), ox1 = std::min(width, xi + 4);
+                    int iy0 = std::max(0, yi - 1), iy1 = std::min(height, yi + 2);
+                    int ix0 = std::max(0, xi - 1), ix1 = std::min(width, xi + 2);
+                    double outer_sum = 0;
+                    int outer_n = 0;
+                    for (int y = oy0; y < oy1; y++)
+                        for (int x = ox0; x < ox1; x++) {
+                            outer_sum += data[y * width + x];
+                            outer_n++;
+                        }
+                    double inner_sum = 0;
+                    int inner_n = 0;
+                    for (int y = iy0; y < iy1; y++)
+                        for (int x = ix0; x < ix1; x++) {
+                            inner_sum += data[y * width + x];
+                            inner_n++;
+                        }
+                    int ring_n = outer_n - inner_n;
+                    if (ring_n > 0) {
+                        double ring_mean = (outer_sum - inner_sum) / ring_n;
+                        double bgmean = bg.mean_at(yi, xi);
+                        double denom = std::max(1.0, ring_mean - bgmean + 1e-9);
+                        double sharp = (peak - ring_mean) / denom;
+                        if (sharp < config.min_sharpness) continue;
+                    }
+                }
+
                 // Step 5: SNR using local background stddev
                 double total_flux = sum_i;
                 int n_pixels = static_cast<int>(cluster_points.size());

@@ -16,9 +16,13 @@ struct StarDetectorConfig {
     float sigma_clip_factor = 3.0f;
     float detection_sigma = 5.0f;
     int min_cluster_size = 3;
-    int max_cluster_size = 500;
+    int max_cluster_size = 30;
     int max_stars = 200;
     int bg_tile_size = 64;   // tile size for local background estimation
+    // Reject low-contrast clusters: ratio of (peak - 7x7 ring mean) to
+    // (ring mean - local background). Real stars are sharply peaked
+    // (~6+ on twilight scenes); diffuse structures and cloud edges score <1.
+    float min_sharpness = 2.0f;
     bool verbose = false;
 };
 
