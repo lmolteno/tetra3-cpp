@@ -8,6 +8,8 @@
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <sys/mman.h>
 
 #if defined(__ARM_NEON)
@@ -283,31 +285,58 @@ std::optional<Frame> LibcameraCapture::capture() {
     frame.data.resize(static_cast<size_t>(out_width) * out_height);
 
     auto t_bin = clock::now();
-    const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    for (int y = 0; y < out_height; y++) {
-        int by = y * 2;
-        const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
-        const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
-        uint16_t *out = frame.data.data() + static_cast<size_t>(y) * out_width;
-        int x = 0;
+    const uint8_t *bytes  = static_cast<const uint8_t *>(data);
+    uint16_t      *out_buf = frame.data.data();
+
+    // 2x2 reduce a row range. Each thread gets its own [y0, y1) strip; reads
+    // are from a shared mmap'd buffer, writes go to non-overlapping ranges of
+    // out_buf, so no synchronisation is needed inside the parallel region.
+    auto bin_rows = [bytes, stride, out_width, out_buf](int y0, int y1) {
+        for (int y = y0; y < y1; y++) {
+            int by = y * 2;
+            const uint16_t *row0 = reinterpret_cast<const uint16_t *>(bytes + by       * stride);
+            const uint16_t *row1 = reinterpret_cast<const uint16_t *>(bytes + (by + 1) * stride);
+            uint16_t *out = out_buf + static_cast<size_t>(y) * out_width;
+            int x = 0;
 #if defined(__ARM_NEON)
-        // 8 output pixels per iteration. With 10-bit input the sum of 4
-        // samples fits comfortably in 16 bits (max 4*1023 = 4092), so we
-        // stay in u16 the whole way through.
-        for (; x + 8 <= out_width; x += 8) {
-            uint16x8x2_t r0 = vld2q_u16(row0 + x * 2);  // even/odd deinterleave
-            uint16x8x2_t r1 = vld2q_u16(row1 + x * 2);
-            uint16x8_t s0  = vaddq_u16(r0.val[0], r0.val[1]);
-            uint16x8_t s1  = vaddq_u16(r1.val[0], r1.val[1]);
-            uint16x8_t avg = vshrq_n_u16(vaddq_u16(s0, s1), 2);
-            vst1q_u16(out + x, avg);
-        }
+            // 8 output pixels per iter. With 10-bit input, sum of 4 fits in
+            // 16 bits (max 4*1023 = 4092) so we stay in u16 throughout.
+            for (; x + 8 <= out_width; x += 8) {
+                uint16x8x2_t r0 = vld2q_u16(row0 + x * 2);
+                uint16x8x2_t r1 = vld2q_u16(row1 + x * 2);
+                uint16x8_t s0  = vaddq_u16(r0.val[0], r0.val[1]);
+                uint16x8_t s1  = vaddq_u16(r1.val[0], r1.val[1]);
+                uint16x8_t avg = vshrq_n_u16(vaddq_u16(s0, s1), 2);
+                vst1q_u16(out + x, avg);
+            }
 #endif
-        for (; x < out_width; x++) {
-            int bx = x * 2;
-            uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
-            out[x] = static_cast<uint16_t>(sum >> 2);
+            for (; x < out_width; x++) {
+                int bx = x * 2;
+                uint32_t sum = row0[bx] + row0[bx + 1] + row1[bx] + row1[bx + 1];
+                out[x] = static_cast<uint16_t>(sum >> 2);
+            }
         }
+    };
+
+    // Pi 2 (and every newer Pi) has 4 cores. Spawn N-1 workers and run the
+    // last strip on this thread. std::thread create+join is ~few hundred us
+    // total — negligible against the ~100 ms+ of work being done.
+    unsigned hwc = std::thread::hardware_concurrency();
+    int n_threads = (hwc == 0) ? 1 : std::min(4u, hwc);
+    if (n_threads <= 1 || out_height < 32) {
+        bin_rows(0, out_height);
+    } else {
+        const int rows_per = (out_height + n_threads - 1) / n_threads;
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads - 1);
+        for (int t = 0; t < n_threads - 1; t++) {
+            int y0 = t * rows_per;
+            int y1 = std::min((t + 1) * rows_per, out_height);
+            if (y0 >= y1) break;
+            workers.emplace_back(bin_rows, y0, y1);
+        }
+        bin_rows((n_threads - 1) * rows_per, out_height);
+        for (auto &w : workers) w.join();
     }
     last_bin_ms_.store(
         std::chrono::duration<float, std::milli>(clock::now() - t_bin).count());
