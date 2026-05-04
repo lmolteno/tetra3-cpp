@@ -77,6 +77,55 @@ std::vector<Centroid> SimpleStarSolver::_undistort_centroids(
     return undistorted_centroids;
 }
 
+std::vector<Centroid> SimpleStarSolver::_undistort_centroids_lens(
+    const std::vector<Centroid> &centroids,
+    int height, int width) {
+    // Polynomial radial undistortion centered at the calibrated optical
+    // axis. After this, every centroid is shifted to the coordinate system
+    // where the geometric image center IS the optical axis, so the rest of
+    // the solver (which uses width/2, height/2 as the projection origin)
+    // works correctly without further changes.
+    std::vector<Centroid> out;
+    out.reserve(centroids.size());
+
+    float img_center_x = static_cast<float>(width) / 2.0f;
+    float img_center_y = static_cast<float>(height) / 2.0f;
+    float cx_t = img_center_x + lens_cx_offset;
+    float cy_t = img_center_y + lens_cy_offset;
+    float half_w = img_center_x;
+    float half_w2 = half_w * half_w;
+
+    for (const auto &c : centroids) {
+        float rx = static_cast<float>(c.x) - cx_t;
+        float ry = static_cast<float>(c.y) - cy_t;
+        float r2 = (rx * rx + ry * ry) / half_w2;
+        // Clamp r²>1 to its boundary value to keep the polynomial well-
+        // behaved past the calibrated region (corners reach r≈1.15).
+        float r2_eval = r2 > 1.0f ? 1.0f : r2;
+        float F = 0.0f;
+        float p = r2_eval;
+        for (float k : lens_k) {
+            F += k * p;
+            p *= r2_eval;
+        }
+        Centroid u;
+        // Undistort to the optical axis frame, then translate to
+        // geometric center. Net: x_out = (W/2) + rx*(1-F).
+        u.x = img_center_x + rx * (1.0f - F);
+        u.y = img_center_y + ry * (1.0f - F);
+        out.push_back(u);
+    }
+    return out;
+}
+
+void SimpleStarSolver::set_lens_calibration(
+    float cx_offset, float cy_offset,
+    const std::vector<float> &k_radial) {
+    lens_cx_offset = cx_offset;
+    lens_cy_offset = cy_offset;
+    lens_k = k_radial;
+}
+
 std::vector<std::array<double, 3>> SimpleStarSolver::sort_pattern_by_centroid(const std::vector<std::array<double, 3>> &vectors) {
     if (vectors.empty()) {
         return {};
@@ -442,11 +491,24 @@ SolveResult SimpleStarSolver::solve_from_centroids(
         : 0.0;
     double k_distortion = distortion_coeff_in.value_or(0.0f);
 
+    // Lens calibration takes precedence: pre-correct all input centroids
+    // using the polynomial + offset center, putting the optical axis at the
+    // geometric center. The rest of the solver then sees an "ideal pinhole"
+    // and does NOT need to fit distortion per frame.
+    bool lens_cal = has_lens_calibration();
     std::vector<Centroid> image_centroids_undist;
-    if (distortion_coeff_in.has_value()) {
+    if (lens_cal) {
+        image_centroids_undist = _undistort_centroids_lens(centroids, height, width);
+    } else if (distortion_coeff_in.has_value()) {
         image_centroids_undist = _undistort_centroids(centroids, height, width, k_distortion);
     } else {
         image_centroids_undist = centroids;
+    }
+    // Force freeze when lens calibration is set: the polynomial already
+    // captures the lens, no per-frame k re-fit is wanted.
+    if (lens_cal) {
+        freeze_distortion = true;
+        k_distortion = 0.0;
     }
 
     int num_extracted_stars_raw = centroids.size();
@@ -1077,7 +1139,10 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                         matches_out->clear();
 
                                         std::vector<Centroid> all_undist;
-                                        if (k_distortion != 0.0f) {
+                                        if (lens_cal) {
+                                            all_undist = _undistort_centroids_lens(
+                                                centroids, height, width);
+                                        } else if (k_distortion != 0.0f) {
                                             all_undist = _undistort_centroids(
                                                 centroids, height, width, k_distortion);
                                         } else {

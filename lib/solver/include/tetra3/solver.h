@@ -25,14 +25,30 @@ private:
     float max_fov_deg = 30.0f;
     size_t num_patterns_in_catalog = 0;
 
+    // Lens calibration: optical-axis offset from geometric center, plus a
+    // radial-only distortion polynomial.
+    //   F(r²) = sum_i k[i] * r^(2*(i+1))
+    //   undistort: rx_pred = rx_obs * (1 - F(r_obs²))
+    // r is normalized by half-width. When lens_k is empty, the solver
+    // behaves as a plain pinhole.
+    float lens_cx_offset = 0.0f;
+    float lens_cy_offset = 0.0f;
+    std::vector<float> lens_k;
+
     static constexpr uint64_t MAGIC_RAND = 2654435761ULL;
 
     std::vector<uint64_t> calculate_powers(int base, unsigned long count);
     std::vector<uint64_t> key_to_index(const std::vector<std::vector<int>> &keys, int bin_factor, uint64_t max_index);
 
+    // Single-k undistortion (legacy path used by the solver's per-frame fit).
     std::vector<Centroid> _undistort_centroids(
         const std::vector<Centroid> &centroids,
         int height, int width, float k_distortion);
+
+    // Polynomial undistortion using the lens calibration set on the solver.
+    std::vector<Centroid> _undistort_centroids_lens(
+        const std::vector<Centroid> &centroids,
+        int height, int width);
 
     std::vector<std::array<double, 3>> sort_pattern_by_centroid(const std::vector<std::array<double, 3>> &vectors);
 
@@ -68,6 +84,16 @@ private:
 public:
     void load_star_catalog(const std::vector<StarEntry> &stars);
     void load_pattern_catalog(const std::vector<PatternEntry> &patterns);
+
+    // Configure a fixed lens calibration: optical-axis offset from the
+    // geometric image center (pixels) and a radial polynomial in r²
+    // (with r = pixel_distance / half_width). When set, the solver uses
+    // this throughout: undistortion of input centroids, projection of
+    // catalog stars to image, and matching. Pass an empty k vector and
+    // zero offsets to disable.
+    void set_lens_calibration(float cx_offset, float cy_offset,
+                              const std::vector<float> &k_radial);
+    bool has_lens_calibration() const { return !lens_k.empty(); }
 
     std::vector<uint64_t> get_table_indices_from_hash(uint64_t hash_index, uint64_t table_size);
 

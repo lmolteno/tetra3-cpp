@@ -78,39 +78,23 @@ static void solve_image(const std::string &image_path,
 
     int num_detected_full = static_cast<int>(detected.size());
 
-    // Apply external polynomial undistortion to all detections (in full-image
-    // coordinates) before either solver pass. poly_undist = [cx_off, cy_off,
-    // k1, k2, k3, ...]; the model is dx_obs = (x-cx_t)*F(r²), so the
-    // undistortion is rx_pred = rx_obs * (1 - F(r_obs²)).
-    auto undistort_full = [&](double x, double y, double &x_out, double &y_out) {
-        if (poly_undist.size() < 3) { x_out = x; y_out = y; return; }
-        double cx = frame.width / 2.0 + poly_undist[0];
-        double cy = frame.height / 2.0 + poly_undist[1];
-        double half_w = frame.width / 2.0;
-        double rx = x - cx;
-        double ry = y - cy;
-        double r2 = (rx * rx + ry * ry) / (half_w * half_w);
-        // The polynomial is only valid up to r ~ the fit range (~1.0);
-        // beyond that, extrapolation is unstable. Clamp r² to 1 to apply
-        // the edge correction value uniformly past the fitted region.
-        double r2_eval = std::min(r2, 1.0);
-        double F = 0.0, p = r2_eval;
+    // Lens calibration: poly_undist = [cx_off, cy_off, k1, k2, k3, ...].
+    // We let the solver apply it internally (set_lens_calibration). For the
+    // crop pass, k coefficients must be rescaled because the solver
+    // normalizes radius by its own half_width.
+    auto build_k = [&](float scale_squared) {
+        std::vector<float> ks;
+        if (poly_undist.size() <= 2) return ks;
+        ks.reserve(poly_undist.size() - 2);
+        float p = scale_squared;
         for (size_t i = 2; i < poly_undist.size(); ++i) {
-            F += poly_undist[i] * p;
-            p *= r2_eval;
+            ks.push_back(static_cast<float>(poly_undist[i]) * p);
+            p *= scale_squared;
         }
-        x_out = cx + rx * (1.0 - F);
-        y_out = cy + ry * (1.0 - F);
+        return ks;
     };
-
-    if (poly_undist.size() >= 3) {
-        for (auto &s : detected) {
-            double ux, uy;
-            undistort_full(s.centroid.x, s.centroid.y, ux, uy);
-            s.centroid.x = ux;
-            s.centroid.y = uy;
-        }
-    }
+    float lens_cx_off = poly_undist.size() >= 2 ? static_cast<float>(poly_undist[0]) : 0.0f;
+    float lens_cy_off = poly_undist.size() >= 2 ? static_cast<float>(poly_undist[1]) : 0.0f;
 
     // --- Pass 1: tight solve on center crop ---
     int cw = std::min(crop_size, static_cast<int>(frame.width));
@@ -145,23 +129,15 @@ static void solve_image(const std::string &image_path,
         std::vector<Centroid> crop_centroids;
         crop_centroids.reserve(crop_detected.size());
         for (const auto &s : crop_detected) {
-            Centroid c = s.centroid;
-            // Polynomial undistortion: convert crop -> full coords, undistort,
-            // convert back to crop. Optical center is geometric so a centered
-            // crop preserves the full-image center.
-            if (poly_undist.size() >= 3) {
-                double ux, uy;
-                undistort_full(c.x + x0, c.y + y0, ux, uy);
-                c.x = ux - x0; c.y = uy - y0;
-            }
-            crop_centroids.push_back(c);
+            crop_centroids.push_back(s.centroid);
         }
 
         // The solver's distortion math normalizes radius by half-width, so
-        // the same physical correction (in pixels) requires a different k
-        // when the half-width changes. For the crop:
-        //   r_undist = r - k_full * r^3 / half_full^2 = r - k_crop * r^3 / half_crop^2
-        //   k_crop = k_full * (half_crop / half_full)^2 = k_full * (cw/W)^2
+        // a single k or a polynomial calibrated against the full image must
+        // be rescaled when the solver runs on the crop. For the crop:
+        //   r_undist = r - k * r^3 / half_w²    (single-k legacy)
+        //   r_norm   = r_pixels / (cw/2)        (polynomial argument)
+        // so each polynomial coefficient k_i scales by (cw/W)^(2i).
         std::optional<float> dist_for_crop;
         if (freeze_k.has_value()) {
             float scale = static_cast<float>(cw) / static_cast<float>(frame.width);
@@ -169,6 +145,16 @@ static void solve_image(const std::string &image_path,
         } else {
             dist_for_crop = distortion_in;
         }
+
+        // Set lens calibration on the solver (or clear it) for the crop pass.
+        if (poly_undist.size() >= 3) {
+            float ratio = static_cast<float>(cw) / static_cast<float>(frame.width);
+            solver.set_lens_calibration(lens_cx_off, lens_cy_off,
+                                         build_k(ratio * ratio));
+        } else {
+            solver.set_lens_calibration(0.0f, 0.0f, {});
+        }
+
         result = solver.solve_from_centroids(
             crop_centroids, ch, cw, crop_fov_deg, 16,
             0.01f, 1e-6f, dist_for_crop, crop_fov_deg * 0.2f, matches_arg,
@@ -192,6 +178,13 @@ static void solve_image(const std::string &image_path,
         centroids.reserve(detected.size());
         for (const auto &s : detected) {
             centroids.push_back(s.centroid);
+        }
+
+        // Set lens calibration for the full-image solve (no rescaling).
+        if (poly_undist.size() >= 3) {
+            solver.set_lens_calibration(lens_cx_off, lens_cy_off, build_k(1.0f));
+        } else {
+            solver.set_lens_calibration(0.0f, 0.0f, {});
         }
 
         std::optional<float> dist_for_full = freeze_k.has_value() ? freeze_k : distortion_in;
