@@ -25,6 +25,11 @@ public:
         float detection_sigma = 5.0f;
         int crop_size = 720;
         int bg_tile = 128;
+        // Single-coefficient lens distortion correction. Calibrated on the
+        // 260504_pi_pictures dataset (Camera Module 3 NoIR Standard, 4.74mm
+        // lens). Set to NaN to disable. Default cuts Dec scatter ~3x and
+        // RMSE ~5x on full-frame solves; small effect on the crop pass.
+        float distortion_k = 0.024f;
     };
 
     struct ResultStamp {

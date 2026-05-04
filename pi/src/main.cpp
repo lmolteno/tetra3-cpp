@@ -56,6 +56,9 @@ struct AppConfig {
     float detection_sigma = 5.0f;
     int crop_size = 720;
     int bg_tile = 128;
+    // Lens distortion correction (Camera Module 3 NoIR Standard, calibrated).
+    // Pass NaN to disable. See SolverProcess::Config.distortion_k.
+    float distortion_k = 0.024f;
     bool no_solver = false;
 };
 
@@ -81,6 +84,8 @@ static AppConfig parse_args(int argc, char *argv[]) {
         else if (arg == "--detection-sigma" && i + 1 < argc) cfg.detection_sigma = std::stof(argv[++i]);
         else if (arg == "--crop"       && i + 1 < argc) cfg.crop_size   = std::stoi(argv[++i]);
         else if (arg == "--bg-tile"    && i + 1 < argc) cfg.bg_tile     = std::stoi(argv[++i]);
+        else if (arg == "--distortion-k"     && i + 1 < argc) cfg.distortion_k = std::stof(argv[++i]);
+        else if (arg == "--no-distortion-k")            cfg.distortion_k = std::nanf("");
         else if (arg == "--no-solver")                  cfg.no_solver   = true;
         else if (arg == "--help" || arg == "-h") {
             std::cerr <<
@@ -100,6 +105,10 @@ static AppConfig parse_args(int argc, char *argv[]) {
                 "  --detection-sigma <n>     Star detection threshold (default 5)\n"
                 "  --crop <n>                Solver crop size (default 720)\n"
                 "  --bg-tile <n>             Solver bg-tile size (default 128)\n"
+                "  --distortion-k <k>        Frozen radial distortion coefficient passed to\n"
+                "                            solve_cli --freeze-distortion-k (default 0.024,\n"
+                "                            calibrated for Camera Module 3 NoIR Standard)\n"
+                "  --no-distortion-k         Disable distortion correction (fall back to k=0)\n"
                 "  --no-solver               Don't spawn solve_cli; emit no-solve frames only\n";
             std::exit(0);
         }
@@ -195,6 +204,7 @@ int main(int argc, char *argv[]) {
         sc.detection_sigma = cfg.detection_sigma;
         sc.crop_size       = cfg.crop_size;
         sc.bg_tile         = cfg.bg_tile;
+        sc.distortion_k    = cfg.distortion_k;
         solver = std::make_unique<SolverProcess>(std::move(sc));
         if (!solver->start()) {
             announce("Solver fail");

@@ -1,6 +1,7 @@
 #include "solver/solver_process.h"
 
 #include <cerrno>
+#include <cmath>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -67,7 +68,7 @@ bool SolverProcess::start() {
         std::vector<std::string> args = {cfg_.binary_path, "--batch"};
         if (!cfg_.db_stars.empty())    { args.push_back("--db-stars");    args.push_back(cfg_.db_stars); }
         if (!cfg_.db_patterns.empty()) { args.push_back("--db-patterns"); args.push_back(cfg_.db_patterns); }
-        char fov_buf[32], sigma_buf[32], crop_buf[32], bg_buf[32];
+        char fov_buf[32], sigma_buf[32], crop_buf[32], bg_buf[32], k_buf[32];
         std::snprintf(fov_buf,   sizeof(fov_buf),   "%g", cfg_.fov_deg);
         std::snprintf(sigma_buf, sizeof(sigma_buf), "%g", cfg_.detection_sigma);
         std::snprintf(crop_buf,  sizeof(crop_buf),  "%d", cfg_.crop_size);
@@ -76,6 +77,11 @@ bool SolverProcess::start() {
         args.push_back("--detection-sigma"); args.push_back(sigma_buf);
         args.push_back("--crop");            args.push_back(crop_buf);
         args.push_back("--bg-tile");         args.push_back(bg_buf);
+        if (std::isfinite(cfg_.distortion_k)) {
+            std::snprintf(k_buf, sizeof(k_buf), "%g", cfg_.distortion_k);
+            args.push_back("--freeze-distortion-k");
+            args.push_back(k_buf);
+        }
 
         std::vector<char *> argv;
         argv.reserve(args.size() + 1);
