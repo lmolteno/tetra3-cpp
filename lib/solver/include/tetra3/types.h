@@ -29,6 +29,18 @@ struct SolveResult {
     float distortion_k;
 };
 
+// Per-pair diagnostic emitted on demand by SimpleStarSolver::solve_from_centroids
+// (pass a non-null vector*). Coordinates are in the original (un-cropped) image
+// the caller passed in; the solver does NOT remap them.
+struct MatchInfo {
+    int catalog_index;             // index into the loaded star catalog
+    double img_x, img_y;           // observed centroid (post-undistortion)
+    double pred_x, pred_y;         // catalog star projected with the final solve
+    double residual_pix;           // sqrt((img-pred)^2)
+    float catalog_ra, catalog_dec; // radians, copied for convenience
+    float magnitude;
+};
+
 inline long double combinations(int n, int k) {
     if (k < 0 || k > n) {
         return 0;

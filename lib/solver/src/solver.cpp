@@ -424,7 +424,10 @@ SolveResult SimpleStarSolver::solve_from_centroids(
     float match_radius,
     float match_threshold,
     std::optional<float> distortion_coeff_in,
-    float fov_max_error_deg) {
+    float fov_max_error_deg,
+    std::vector<MatchInfo> *matches_out,
+    bool freeze_distortion,
+    float extended_match_radius) {
     auto start_time = std::chrono::high_resolution_clock::now();
     SolveResult result = {false, 0, 0, 0, 0, 0, 0, 0, 0.0f};
 
@@ -876,7 +879,7 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                                       rotation_matrix_eigen(2, 2));
                                     if (roll < 0) roll += 2.0f * M_PI;
 
-                                    if (!distortion_coeff_in.has_value()) {
+                                    if (!distortion_coeff_in.has_value() || freeze_distortion) {
                                         std::vector<float> angles_camera;
                                         std::vector<float> angles_catalogue;
 
@@ -902,7 +905,13 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                                 fov *= (mean_ratio / count_ratios);
                                             }
                                         }
-                                        k_distortion = 0.0f;
+                                        if (!freeze_distortion) {
+                                            k_distortion = 0.0f;
+                                        }
+                                        // matched_image_centroids is already
+                                        // undistorted by k_in if freeze is on
+                                        // (centroids were undistorted at the
+                                        // top of solve_from_centroids).
                                         image_centroids_undist = matched_image_centroids;
                                     } else {
                                         Eigen::MatrixXf matched_catalog_vectors_eigen(
@@ -1055,6 +1064,141 @@ SolveResult SimpleStarSolver::solve_from_centroids(
                                             num_star_matches = static_cast<int>(inlier_img_c.size());
                                             rmse_rad = std::sqrt(sum_angle_sq / angles_residual_rad.size());
                                             residual_arcsec = rmse_rad * 180.0f / M_PI * 3600.0f;
+                                        }
+                                    }
+
+                                    if (matches_out && extended_match_radius > 0.0f) {
+                                        // Rich match pass for distortion analysis.
+                                        // Re-project ALL nearby catalog stars (no
+                                        // num_image_centroids cap) using the final
+                                        // R + fov + k_distortion, and match them
+                                        // against ALL input centroids (undistorted)
+                                        // with a generous radius.
+                                        matches_out->clear();
+
+                                        std::vector<Centroid> all_undist;
+                                        if (k_distortion != 0.0f) {
+                                            all_undist = _undistort_centroids(
+                                                centroids, height, width, k_distortion);
+                                        } else {
+                                            all_undist = centroids;
+                                        }
+
+                                        std::array<float, 3> bs = {
+                                            rotation_matrix_eigen(0, 0),
+                                            rotation_matrix_eigen(0, 1),
+                                            rotation_matrix_eigen(0, 2)};
+                                        float fov_diag = static_cast<float>(fov) * std::sqrt(
+                                            static_cast<float>(width) * width +
+                                            static_cast<float>(height) * height) /
+                                            static_cast<float>(width);
+                                        auto rich_inds = get_nearby_stars(bs, fov_diag / 2.0f);
+
+                                        std::vector<Centroid> rich_proj;
+                                        std::vector<int> rich_proj_idx;
+                                        rich_proj.reserve(rich_inds.size());
+                                        rich_proj_idx.reserve(rich_inds.size());
+
+                                        Eigen::MatrixXf rich_cat(rich_inds.size(), 3);
+                                        for (size_t i = 0; i < rich_inds.size(); ++i) {
+                                            const auto &s = star_catalog[rich_inds[i]];
+                                            rich_cat(i, 0) = s.x;
+                                            rich_cat(i, 1) = s.y;
+                                            rich_cat(i, 2) = s.z;
+                                        }
+                                        Eigen::MatrixXf rich_cam =
+                                            (rotation_matrix_eigen * rich_cat.transpose()).transpose();
+
+                                        float scale_inv = static_cast<float>(width) /
+                                            (2.0f * std::tan(static_cast<float>(fov) / 2.0f));
+                                        float img_cy = static_cast<float>(height) / 2.0f;
+                                        float img_cx = static_cast<float>(width) / 2.0f;
+
+                                        for (size_t i = 0; i < rich_inds.size(); ++i) {
+                                            float vx = rich_cam(i, 0);
+                                            float vy = rich_cam(i, 1);
+                                            float vz = rich_cam(i, 2);
+                                            if (vx <= 1e-6f) continue;
+                                            Centroid c{};
+                                            c.x = img_cx - (vy / vx) * scale_inv;
+                                            c.y = img_cy - (vz / vx) * scale_inv;
+                                            if (c.x < 0 || c.x >= width || c.y < 0 || c.y >= height)
+                                                continue;
+                                            rich_proj.push_back(c);
+                                            rich_proj_idx.push_back(rich_inds[i]);
+                                        }
+
+                                        float ext_pix = static_cast<float>(width) * extended_match_radius;
+                                        auto ext_pairs = _find_centroid_matches(
+                                            all_undist, rich_proj, ext_pix);
+
+                                        matches_out->reserve(ext_pairs.size());
+                                        for (const auto &mp : ext_pairs) {
+                                            MatchInfo m{};
+                                            int img_i = mp[0];
+                                            int proj_i = mp[1];
+                                            int cat_global = rich_proj_idx[proj_i];
+                                            m.catalog_index = cat_global;
+                                            const auto &s = star_catalog[cat_global];
+                                            m.catalog_ra = s.ra;
+                                            m.catalog_dec = s.dec;
+                                            m.magnitude = s.magnitude;
+                                            m.img_x = all_undist[img_i].x;
+                                            m.img_y = all_undist[img_i].y;
+                                            m.pred_x = rich_proj[proj_i].x;
+                                            m.pred_y = rich_proj[proj_i].y;
+                                            double dx = m.img_x - m.pred_x;
+                                            double dy = m.img_y - m.pred_y;
+                                            m.residual_pix = std::sqrt(dx * dx + dy * dy);
+                                            matches_out->push_back(m);
+                                        }
+                                    } else if (matches_out) {
+                                        // Standard: emit pairs from matched_stars only.
+                                        matches_out->clear();
+                                        matches_out->reserve(matched_stars.size());
+
+                                        Eigen::MatrixXf cat_eigen(matched_stars.size(), 3);
+                                        for (size_t mi = 0; mi < matched_stars.size(); ++mi) {
+                                            const auto &nv = nearby_star_vectors[matched_stars[mi][1]];
+                                            cat_eigen(mi, 0) = nv[0];
+                                            cat_eigen(mi, 1) = nv[1];
+                                            cat_eigen(mi, 2) = nv[2];
+                                        }
+                                        Eigen::MatrixXf cam_eigen =
+                                            (rotation_matrix_eigen * cat_eigen.transpose()).transpose();
+
+                                        float scale_inv = static_cast<float>(width) /
+                                            (2.0f * std::tan(static_cast<float>(fov) / 2.0f));
+                                        float img_cy = static_cast<float>(height) / 2.0f;
+                                        float img_cx = static_cast<float>(width) / 2.0f;
+
+                                        for (size_t mi = 0; mi < matched_stars.size(); ++mi) {
+                                            MatchInfo m{};
+                                            int nearby_idx = matched_stars[mi][1];
+                                            int cat_idx = nearby_star_inds[nearby_idx];
+                                            m.catalog_index = cat_idx;
+                                            if (static_cast<size_t>(cat_idx) < star_catalog.size()) {
+                                                const auto &s = star_catalog[cat_idx];
+                                                m.catalog_ra = s.ra;
+                                                m.catalog_dec = s.dec;
+                                                m.magnitude = s.magnitude;
+                                            }
+                                            m.img_x = image_centroids_undist[mi].x;
+                                            m.img_y = image_centroids_undist[mi].y;
+                                            float vx = cam_eigen(mi, 0);
+                                            float vy = cam_eigen(mi, 1);
+                                            float vz = cam_eigen(mi, 2);
+                                            if (vx > 1e-9f) {
+                                                m.pred_x = img_cx - (vy / vx) * scale_inv;
+                                                m.pred_y = img_cy - (vz / vx) * scale_inv;
+                                            } else {
+                                                m.pred_x = std::numeric_limits<double>::quiet_NaN();
+                                                m.pred_y = std::numeric_limits<double>::quiet_NaN();
+                                            }
+                                            double dx = m.img_x - m.pred_x;
+                                            double dy = m.img_y - m.pred_y;
+                                            m.residual_pix = std::sqrt(dx * dx + dy * dy);
+                                            matches_out->push_back(m);
                                         }
                                     }
 

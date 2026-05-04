@@ -79,7 +79,10 @@ public:
         float match_radius = 0.01,
         float match_threshold = 0.001,
         std::optional<float> distortion_coeff_in = std::nullopt,
-        float fov_max_error_deg = 0.0f);
+        float fov_max_error_deg = 0.0f,
+        std::vector<MatchInfo> *matches_out = nullptr,
+        bool freeze_distortion = false,
+        float extended_match_radius = 0.0f);
 
     size_t get_memory_usage() const;
     void print_memory_usage() const;
