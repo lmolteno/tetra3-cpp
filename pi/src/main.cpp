@@ -21,6 +21,7 @@
 #include "capture/frame_source.h"
 #include "capture/image_loader.h"
 #include "render/buffer_canvas.h"
+#include "render/i2c_ssd1306.h"
 #include "render/tracker_view.h"
 #include "app/polar_align.h"
 #include "io/json_sink.h"
@@ -60,6 +61,8 @@ struct AppConfig {
     // Pass NaN to disable. See SolverProcess::Config.distortion_k.
     float distortion_k = 0.024f;
     bool no_solver = false;
+    bool oled = false;
+    std::string oled_bus = "/dev/i2c-1";
 };
 
 static AppConfig parse_args(int argc, char *argv[]) {
@@ -87,6 +90,8 @@ static AppConfig parse_args(int argc, char *argv[]) {
         else if (arg == "--distortion-k"     && i + 1 < argc) cfg.distortion_k = std::stof(argv[++i]);
         else if (arg == "--no-distortion-k")            cfg.distortion_k = std::nanf("");
         else if (arg == "--no-solver")                  cfg.no_solver   = true;
+        else if (arg == "--oled")                       cfg.oled        = true;
+        else if (arg == "--oled-bus"   && i + 1 < argc) cfg.oled_bus   = argv[++i];
         else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: pi_tracker [options]\n"
@@ -109,7 +114,9 @@ static AppConfig parse_args(int argc, char *argv[]) {
                 "                            solve_cli --freeze-distortion-k (default 0.024,\n"
                 "                            calibrated for Camera Module 3 NoIR Standard)\n"
                 "  --no-distortion-k         Disable distortion correction (fall back to k=0)\n"
-                "  --no-solver               Don't spawn solve_cli; emit no-solve frames only\n";
+                "  --no-solver               Don't spawn solve_cli; emit no-solve frames only\n"
+                "  --oled                    Push framebuffer to SSD1306 OLED via I2C (0x3C)\n"
+                "  --oled-bus <dev>          I2C bus device (default /dev/i2c-1)\n";
             std::exit(0);
         }
     }
@@ -153,6 +160,15 @@ int main(int argc, char *argv[]) {
 
     BufferCanvas canvas;
     TrackerView view;
+
+    std::unique_ptr<I2cSsd1306> oled;
+    if (cfg.oled) {
+        try {
+            oled = std::make_unique<I2cSsd1306>(cfg.oled_bus.c_str());
+        } catch (const std::exception &e) {
+            std::cerr << "OLED init failed: " << e.what() << '\n';
+        }
+    }
     PolarAligner aligner(cfg.lat, cfg.lon);
     AppMode mode = AppMode::Tracking;
     ControlInput input;
@@ -327,6 +343,13 @@ int main(int argc, char *argv[]) {
         // 5. Render + publish. We render every tick (even if no fresh frame
         //    arrived) so commands and solver results show up at publish rate.
         view.render(canvas, mode, last_result, aligner);
+        if (oled) {
+            try { oled->flush(canvas.framebuffer()); }
+            catch (const std::exception &e) {
+                std::cerr << "OLED flush: " << e.what() << '\n';
+                oled.reset();  // stop trying after a hard I2C error
+            }
+        }
 
         json_sink::State s;
         fill_state(s);
