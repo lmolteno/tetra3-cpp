@@ -9,7 +9,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <linux/i2c-dev.h>
+// I2C_SLAVE is 0x0703 on all Linux architectures; define it here so we don't
+// need linux/i2c-dev.h (not installed in Alpine musl build environments).
+#ifndef I2C_SLAVE
+#define I2C_SLAVE 0x0703
+#endif
 
 // Thin I2C driver for the SSD1306 128x64 OLED.
 //
