@@ -62,6 +62,22 @@ if(LIBCAMERA_FOUND)
     target_link_libraries(pi_tracker PRIVATE ${LIBCAMERA_LIBRARIES})
 endif()
 
+# oled_test: cycles through every TrackerView state, prints ASCII art to stdout,
+# and optionally drives a real SSD1306 via --oled.  No camera or solver needed.
+add_executable(oled_test
+    src/oled_test.cpp
+    src/render/tracker_view.cpp
+    src/render/star_map.cpp
+    src/render/font_6x8.cpp
+    src/render/text.cpp
+    src/app/polar_align.cpp
+)
+target_include_directories(oled_test PRIVATE src)
+target_link_libraries(oled_test PRIVATE tetra3_solver)
+if(PI_NEON_ARMHF)
+    target_compile_options(oled_test PRIVATE -mfpu=neon-vfpv4)
+endif()
+
 # solve_cli: fully static. No libcamera, no OpenCV — just stb_image + zlib +
 # Eigen (header-only) + the solver.
 add_executable(solve_cli
