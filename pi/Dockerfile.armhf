@@ -43,9 +43,9 @@ COPY . .
 # final stage can COPY them.
 RUN --mount=type=cache,id=pi_tracker_armhf_build,target=/src/build \
     cmake -B build -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build --target pi_tracker solve_cli -j"$(nproc)" \
+ && cmake --build build --target pi_tracker solve_cli oled_test -j"$(nproc)" \
  && mkdir -p /out \
- && cp build/pi/pi_tracker build/pi/solve_cli /out/
+ && cp build/pi/pi_tracker build/pi/solve_cli build/pi/oled_test /out/
 
 # Tiny runtime stage. Only libcamera + IPA modules; everything else is in the
 # binary. solve_cli has zero runtime deps.
@@ -53,3 +53,4 @@ FROM --platform=linux/arm/v7 arm32v7/alpine:edge
 RUN apk add --no-cache libcamera libcamera-raspberrypi
 COPY --from=builder /out/pi_tracker /out/pi_tracker
 COPY --from=builder /out/solve_cli  /out/solve_cli
+COPY --from=builder /out/oled_test  /out/oled_test

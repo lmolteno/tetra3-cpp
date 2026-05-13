@@ -28,6 +28,7 @@
 #include "capture/frame_writer.h"
 #include "solver/solver_process.h"
 #include "io/control_input.h"
+#include "io/gpio_button.h"
 #include "app/cam_state.h"
 
 #ifdef HAS_LIBCAMERA
@@ -63,6 +64,7 @@ struct AppConfig {
     bool no_solver = false;
     bool oled = false;
     std::string oled_bus = "/dev/i2c-1";
+    int gpio_button = -1;
 };
 
 static AppConfig parse_args(int argc, char *argv[]) {
@@ -91,7 +93,8 @@ static AppConfig parse_args(int argc, char *argv[]) {
         else if (arg == "--no-distortion-k")            cfg.distortion_k = std::nanf("");
         else if (arg == "--no-solver")                  cfg.no_solver   = true;
         else if (arg == "--oled")                       cfg.oled        = true;
-        else if (arg == "--oled-bus"   && i + 1 < argc) cfg.oled_bus   = argv[++i];
+        else if (arg == "--oled-bus"    && i + 1 < argc) cfg.oled_bus    = argv[++i];
+        else if (arg == "--gpio-button" && i + 1 < argc) cfg.gpio_button = std::stoi(argv[++i]);
         else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: pi_tracker [options]\n"
@@ -116,7 +119,8 @@ static AppConfig parse_args(int argc, char *argv[]) {
                 "  --no-distortion-k         Disable distortion correction (fall back to k=0)\n"
                 "  --no-solver               Don't spawn solve_cli; emit no-solve frames only\n"
                 "  --oled                    Push framebuffer to SSD1306 OLED via I2C (0x3C)\n"
-                "  --oled-bus <dev>          I2C bus device (default /dev/i2c-1)\n";
+                "  --oled-bus <dev>          I2C bus device (default /dev/i2c-1)\n"
+                "  --gpio-button <pin>       BCM pin for mode-cycle button (active-low)\n";
             std::exit(0);
         }
     }
@@ -160,6 +164,15 @@ int main(int argc, char *argv[]) {
 
     BufferCanvas canvas;
     TrackerView view;
+
+    std::unique_ptr<GpioButton> button;
+    if (cfg.gpio_button >= 0) {
+        try {
+            button = std::make_unique<GpioButton>(cfg.gpio_button);
+        } catch (const std::exception &e) {
+            std::cerr << "GPIO button init failed: " << e.what() << '\n';
+        }
+    }
 
     std::unique_ptr<I2cSsd1306> oled;
     if (cfg.oled) {
@@ -260,6 +273,17 @@ int main(int argc, char *argv[]) {
         next_tick += frame_period;
 
         // 1. Drain any pending stdin commands.
+        if (button && button->poll_press()) {
+            if (mode == AppMode::Tracking) {
+                aligner.clear_samples();
+                mode = AppMode::PASampling;
+            } else if (mode == AppMode::PASampling) {
+                if (aligner.num_samples() >= 3) mode = AppMode::PAFix;
+            } else if (mode == AppMode::PAFix) {
+                mode = AppMode::Tracking;
+            }
+        }
+
         for (const auto &cmd : input.poll()) {
             if (cmd.mode) {
                 AppMode want = *cmd.mode;

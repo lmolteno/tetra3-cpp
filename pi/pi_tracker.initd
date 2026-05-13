@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+
+description="Pi star tracker daemon"
+
+# Paths — adjust to match where you deployed the binaries
+DEPLOY_DIR="/root"
+
+command="${DEPLOY_DIR}/pi_tracker"
+command_args="
+    --oled
+    --gpio-button 23
+    --solver ${DEPLOY_DIR}/solve_cli
+    --db-stars ${DEPLOY_DIR}/tetra3_db_stars.bin
+    --db-patterns ${DEPLOY_DIR}/tetra3_db_patterns.bin
+    --gain 16
+    --exposure-us 500000
+    --fov 70
+    --distortion-k 0.024
+"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+    need localmount
+    after bootmisc modules
+}
