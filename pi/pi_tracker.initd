@@ -3,12 +3,15 @@
 description="Pi star tracker daemon"
 
 # Paths — adjust to match where you deployed the binaries
-DEPLOY_DIR="/root"
+DEPLOY_DIR="/home/linus"
 
 command="${DEPLOY_DIR}/pi_tracker"
 command_args="
     --oled
+    --flip-display
     --gpio-button 23
+    --gpio-back 16
+    --roll-offset 90
     --solver ${DEPLOY_DIR}/solve_cli
     --db-stars ${DEPLOY_DIR}/tetra3_db_stars.bin
     --db-patterns ${DEPLOY_DIR}/tetra3_db_patterns.bin

@@ -27,9 +27,11 @@ public:
     static constexpr int H = 64;
     static constexpr std::size_t FB_SIZE = W * H / 8;  // 1024 bytes, 8 pages
 
-    // bus: Linux i2c device node, e.g. "/dev/i2c-1"
+    // bus:  Linux i2c device node, e.g. "/dev/i2c-1"
     // addr: 7-bit I2C address (0x3C or 0x3D depending on SA0 pin)
-    explicit I2cSsd1306(const char *bus = "/dev/i2c-1", uint8_t addr = 0x3C) {
+    // flip: rotate display 180° (for upside-down mounting)
+    explicit I2cSsd1306(const char *bus = "/dev/i2c-1", uint8_t addr = 0x3C,
+                        bool flip = false) : flip_(flip) {
         fd_ = ::open(bus, O_RDWR);
         if (fd_ < 0)
             throw std::runtime_error(std::string("SSD1306: open ") + bus + " failed");
@@ -64,7 +66,8 @@ public:
     }
 
 private:
-    int fd_ = -1;
+    int fd_   = -1;
+    bool flip_ = false;
 
     void write_raw(const uint8_t *data, std::size_t len) {
         if (::write(fd_, data, len) != static_cast<ssize_t>(len))
@@ -88,8 +91,8 @@ private:
         cmd({0x40});             // display start line = 0
         cmd({0x8D, 0x14});       // charge pump: enable (internal VCC)
         cmd({0x20, 0x00});       // memory addressing: horizontal — enables bulk flush
-        cmd({0xA1});             // segment remap: col 127 -> SEG0 (flip X)
-        cmd({0xC8});             // COM scan: row N-1 -> COM0 (flip Y)
+        cmd({flip_ ? uint8_t(0xA0) : uint8_t(0xA1)});  // seg remap  (0xA1 = flip X)
+        cmd({flip_ ? uint8_t(0xC0) : uint8_t(0xC8)});  // COM scan   (0xC8 = flip Y)
         cmd({0xDA, 0x12});       // COM pins: alt config, no remap (for 128x64)
         cmd({0x81, 0xCF});       // contrast
         cmd({0xD9, 0xF1});       // pre-charge period
