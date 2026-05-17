@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -30,6 +31,7 @@
 #include "io/control_input.h"
 #include "io/gpio_button.h"
 #include "app/cam_state.h"
+#include "imu/imu_tracker.h"
 
 #ifdef HAS_LIBCAMERA
 #include "capture/camera_capture.h"
@@ -68,6 +70,16 @@ struct AppConfig {
     int gpio_button = -1;  // forward button: cycles into PA modes
     int gpio_back   = -1;  // back button: exits PA modes
     float roll_offset_deg = 0.0f;  // added to solve roll before star-map render
+
+    // IMU (MPU-9250). Off by default; --imu enables it. Magnetometer is
+    // always disabled in the filter path (too noisy on this hardware); the
+    // IMU→camera frame transform is recovered post-hoc from the first ~10 s
+    // of plate solves via hand-eye calibration.
+    bool        imu              = false;
+    std::string imu_bus          = "/dev/i2c-1";
+    int         imu_addr         = 0x68;
+    // If non-empty: write raw IMU samples + solves to this file (CSV).
+    std::string imu_log          = "";
 };
 
 static AppConfig parse_args(int argc, char *argv[]) {
@@ -101,6 +113,17 @@ static AppConfig parse_args(int argc, char *argv[]) {
         else if (arg == "--gpio-button"  && i + 1 < argc) cfg.gpio_button  = std::stoi(argv[++i]);
         else if (arg == "--gpio-back"    && i + 1 < argc) cfg.gpio_back    = std::stoi(argv[++i]);
         else if (arg == "--roll-offset"  && i + 1 < argc) cfg.roll_offset_deg = std::stof(argv[++i]);
+        else if (arg == "--imu")                            cfg.imu          = true;
+        else if (arg == "--imu-bus"      && i + 1 < argc) cfg.imu_bus      = argv[++i];
+        else if (arg == "--imu-addr"     && i + 1 < argc) cfg.imu_addr     = std::stoi(argv[++i], nullptr, 0);
+        else if (arg == "--imu-log"      && i + 1 < argc) cfg.imu_log      = argv[++i];
+        // Deprecated mag/axes flags — silently ignored (kept here so old
+        // initd files don't fail to start). The new pipeline doesn't need them.
+        else if ((arg == "--imu-decl" || arg == "--imu-axes" ||
+                  arg == "--imu-mag-offset") && i + 1 < argc) {
+            ++i;  // skip value
+        }
+        else if (arg == "--imu-no-mag") { /* always 6-DOF now */ }
         else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: pi_tracker [options]\n"
@@ -129,7 +152,14 @@ static AppConfig parse_args(int argc, char *argv[]) {
                 "  --flip-display            Rotate OLED 180° (for upside-down mounting)\n"
                 "  --gpio-button <pin>       BCM pin: forward/enter PA mode (active-low)\n"
                 "  --gpio-back <pin>         BCM pin: back/exit PA mode (active-low)\n"
-                "  --roll-offset <deg>       Degrees added to solve roll before star-map render\n";
+                "  --roll-offset <deg>       Degrees added to solve roll before star-map render\n"
+                "  --imu                     Enable MPU-9250 IMU for between-solve pointing.\n"
+                "                            6-DOF filter (no magnetometer). R_cam->body is\n"
+                "                            recovered from the first ~10 s of plate solves.\n"
+                "  --imu-bus <dev>           IMU I2C bus device (default /dev/i2c-1)\n"
+                "  --imu-addr <0x68|0x69>    IMU I2C address (default 0x68)\n"
+                "  --imu-log <path>          Append raw IMU samples + solve events to this CSV\n"
+                "                            for offline analysis (~15 KB/s, truncated at startup)\n";
             std::exit(0);
         }
     }
@@ -204,6 +234,21 @@ int main(int argc, char *argv[]) {
     PolarAligner aligner(cfg.lat, cfg.lon);
     AppMode mode = AppMode::Tracking;
     ControlInput input;
+
+    std::unique_ptr<imu::ImuTracker> imu_tracker;
+    if (cfg.imu) {
+        imu::ImuTracker::Config ic;
+        ic.i2c_bus       = cfg.imu_bus;
+        ic.mpu_addr      = static_cast<std::uint8_t>(cfg.imu_addr);
+        ic.imu_log_path  = cfg.imu_log;
+        imu_tracker = std::make_unique<imu::ImuTracker>(ic);
+        if (!imu_tracker->start()) {
+            std::cerr << "IMU init failed on " << cfg.imu_bus
+                      << " @ 0x" << std::hex << cfg.imu_addr << std::dec
+                      << " — continuing without IMU\n";
+            imu_tracker.reset();
+        }
+    }
 
     cam_state::Settings cs = cam_state::load(cfg.state_dir);
     // CLI flags override saved state (and persist on use).
@@ -385,6 +430,10 @@ int main(int argc, char *argv[]) {
                     (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
                     aligner.add_sample(last_result.ra, last_result.dec, now_steady());
                 }
+                if (last_result.solved && imu_tracker) {
+                    imu_tracker->update_solve(last_result.ra, last_result.dec,
+                                              last_result.roll);
+                }
             }
         }
 
@@ -393,7 +442,26 @@ int main(int argc, char *argv[]) {
         SolveResult display_result = last_result;
         if (display_result.solved && cfg.roll_offset_deg != 0.0f)
             display_result.roll += cfg.roll_offset_deg * float(M_PI) / 180.0f;
-        view.render(canvas, mode, display_result, aligner);
+
+        std::optional<imu::Pointing> imu_pt;
+        if (imu_tracker) imu_pt = imu_tracker->get_pointing();
+        ImuHint imu_hint{};
+        const ImuHint *imu_hint_ptr = nullptr;
+        if (imu_pt) {
+            imu_hint.ra   = imu_pt->ra;
+            imu_hint.dec  = imu_pt->dec;
+            // Apply the same roll offset as solve mode so the star map keeps
+            // its orientation when the display switches between sources.
+            imu_hint.roll = imu_pt->roll
+                          + cfg.roll_offset_deg * static_cast<float>(M_PI) / 180.0f;
+            // Use the last solve's FOV when we have one, otherwise the hint.
+            imu_hint.fov = last_result.solved
+                ? last_result.fov
+                : cfg.fov_deg * static_cast<float>(M_PI) / 180.0f;
+            imu_hint.calibrated = imu_pt->calibrated;
+            imu_hint_ptr = &imu_hint;
+        }
+        view.render(canvas, mode, display_result, aligner, imu_hint_ptr);
         if (oled) {
             try { oled->flush(canvas.framebuffer()); }
             catch (const std::exception &e) {
@@ -424,6 +492,13 @@ int main(int argc, char *argv[]) {
         }
         if (last_result_at != clock::time_point{}) {
             s.timing.result_age = ms_since(last_result_at);
+        }
+        if (imu_pt) {
+            s.imu_valid      = true;
+            s.imu_ra         = imu_pt->ra;
+            s.imu_dec        = imu_pt->dec;
+            s.imu_roll       = imu_pt->roll;
+            s.imu_calibrated = imu_pt->calibrated;
         }
         s.fb = canvas.framebuffer();
         s.fb_size = canvas.framebuffer_size();

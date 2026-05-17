@@ -106,6 +106,15 @@ void publish(std::ostream &out, const State &s) {
         }
     }
 
+    if (s.imu_valid) {
+        out << ",\"imu\":{"
+            << "\"ra_rad\":"      << s.imu_ra
+            << ",\"dec_rad\":"    << s.imu_dec
+            << ",\"roll_rad\":"   << s.imu_roll
+            << ",\"calibrated\":" << (s.imu_calibrated ? "true" : "false")
+            << "}";
+    }
+
     if (s.fb && s.fb_size > 0) {
         out << ",\"fb\":\"";
         write_base64(out, s.fb, s.fb_size);

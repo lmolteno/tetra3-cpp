@@ -51,6 +51,13 @@ struct State {
 
     Timing timing;
 
+    // IMU pointing. imu_valid=false → omitted from output.
+    bool  imu_valid      = false;
+    float imu_ra         = 0.0f;
+    float imu_dec        = 0.0f;
+    float imu_roll       = 0.0f;
+    bool  imu_calibrated = false;
+
     const std::uint8_t *fb = nullptr;
     std::size_t fb_size = 0;
 };

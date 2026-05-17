@@ -11,7 +11,7 @@ command_args="
     --flip-display
     --gpio-button 23
     --gpio-back 16
-    --roll-offset 90
+    --roll-offset 180
     --solver ${DEPLOY_DIR}/solve_cli
     --db-stars ${DEPLOY_DIR}/tetra3_db_stars.bin
     --db-patterns ${DEPLOY_DIR}/tetra3_db_patterns.bin
@@ -19,11 +19,19 @@ command_args="
     --exposure-us 500000
     --fov 70
     --distortion-k 0.024
+    --lat -45.8
+    --lon 170.5
+    --imu
+    --imu-log /home/linus/pi_tracker_imu.csv
 "
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/${RC_SVCNAME}.log"
 error_log="/var/log/${RC_SVCNAME}.log"
+
+start_pre() {
+    checkpath --file --mode 0644 "${output_log}"
+}
 
 depend() {
     need localmount

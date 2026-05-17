@@ -21,6 +21,10 @@ set(PI_SOURCES
     src/io/control_input.cpp
     src/app/polar_align.cpp
     src/app/cam_state.cpp
+    src/imu/mpu9250.cpp
+    src/imu/madgwick.cpp
+    src/imu/sky_math.cpp
+    src/imu/imu_tracker.cpp
 )
 
 # Optional: libcamera (camera frame source). Stays dynamic — libcamera dlopens

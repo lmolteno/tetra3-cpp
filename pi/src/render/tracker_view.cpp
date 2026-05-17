@@ -15,12 +15,13 @@ struct StarMapAdapter : IStarMapCanvas {
 
 void TrackerView::render(ICanvas &canvas, AppMode mode,
                          const SolveResult &result,
-                         const PolarAligner &aligner) {
+                         const PolarAligner &aligner,
+                         const ImuHint *imu) {
     canvas.clear();
 
     switch (mode) {
     case AppMode::Tracking:
-        draw_tracking(canvas, result);
+        draw_tracking(canvas, result, imu);
         break;
     case AppMode::PASampling: {
         auto pole = aligner.estimate_pole();
@@ -44,16 +45,20 @@ void TrackerView::render_status(ICanvas &canvas, const std::string &msg) {
     canvas.update();
 }
 
-void TrackerView::draw_tracking(ICanvas &canvas, const SolveResult &result) {
+void TrackerView::draw_tracking(ICanvas &canvas, const SolveResult &result,
+                                const ImuHint *imu) {
     if (result.solved) {
-        // Show the central half of the camera FOV on the map
+        // Show the central half of the camera FOV on the map.
         float map_fov = result.fov * 0.5f;
         StarMapAdapter adapter(canvas);
         star_map_.render(adapter, WIDTH, MAP_Y1 + 1,
                          result.ra, result.dec, map_fov, result.roll);
-        // Clip to the map area: render uses 0..height-1 of its canvas, but
-        // we want the full strip 0..MAP_Y1 here, which matches.
         draw_coord_bar(canvas, result.ra, result.dec);
+    } else if (imu) {
+        StarMapAdapter adapter(canvas);
+        star_map_.render(adapter, WIDTH, MAP_Y1 + 1,
+                         imu->ra, imu->dec, imu->fov * 0.5f, imu->roll);
+        draw_imu_bar(canvas, *imu);
     } else {
         draw_no_solution(canvas);
     }
@@ -61,6 +66,20 @@ void TrackerView::draw_tracking(ICanvas &canvas, const SolveResult &result) {
 
 void TrackerView::draw_no_solution(ICanvas &canvas) {
     text::draw(canvas, 1, COORD_Y, "No solution");
+}
+
+void TrackerView::draw_imu_bar(ICanvas &canvas, const ImuHint &imu) {
+    // Pre-calibration: the IMU pointing is a rough accel+mag fix without the
+    // benefit of a plate solve, so don't pretend it's a precise RA/Dec. After
+    // calibration we still tag it as IMU so the user knows it isn't fresh.
+    const char *tag = imu.calibrated ? "IMU" : "IMU?";
+    char buf[24];
+    float ra_h = imu.ra * 12.0f / static_cast<float>(M_PI);
+    if (ra_h < 0)      ra_h += 24.0f;
+    if (ra_h >= 24.0f) ra_h -= 24.0f;
+    float dec_deg = imu.dec * 180.0f / static_cast<float>(M_PI);
+    snprintf(buf, sizeof(buf), "%s %4.1fh %+5.1f\xB0", tag, ra_h, dec_deg);
+    text::draw(canvas, 1, COORD_Y, buf);
 }
 
 void TrackerView::draw_coord_bar(ICanvas &canvas, float ra_rad, float dec_rad) {
