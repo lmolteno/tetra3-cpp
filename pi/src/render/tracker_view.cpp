@@ -228,13 +228,49 @@ void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
     // Autoscale FOV so the mount-pole marker doesn't get buried. As the
     // operator drives the offset down, the chart zooms in.
     float fov = autoscale_fov_rad(offset.total_arcmin);
-    float cam_roll = pa_fix ? pa_fix->cam_roll : 0.0f;
+
+    // Chart roll: the (ra, dec, roll) parameterisation of camera orientation
+    // has a gimbal-lock singularity at the celestial pole — cos(dec) ≈ 0
+    // there, so atan2-deriving ra from the rotation matrix amplifies small
+    // numerical perturbations into large ra fluctuations (and a coupled
+    // anti-fluctuation in roll). The physical orientation is fine; only the
+    // parameterisation is bad. The chart suffers if we plug cam_roll into
+    // the projection's roll slot directly, because the chart is centred on
+    // a different point than the camera and so cam_roll alone isn't the
+    // right rotation.
+    //
+    // What *is* well-defined everywhere is the camera's image-up vector in
+    // 3D — a unit tangent to the celestial sphere at the camera's pointing
+    // direction. We project that onto the pole's tangent plane and take its
+    // angle: that gives the roll that makes screen-up on the chart match
+    // image-up in the camera view. Near the pole the formula collapses to
+    // the (ra ∓ roll) gimbal-lock-invariant combination (− for SCP, + for
+    // NCP), so the chart sits still even though cam_ra and cam_roll wobble
+    // individually.
+    float chart_roll = 0.0f;
+    if (pa_fix) {
+        float sd = std::sin(pa_fix->cam_dec);
+        float sr = std::sin(pa_fix->cam_ra),  cr = std::cos(pa_fix->cam_ra);
+        float cR = std::cos(pa_fix->cam_roll), sR = std::sin(pa_fix->cam_roll);
+        // image_up_3D = e_dec * cos(roll) − e_ra * sin(roll),
+        //   e_dec = (-sd·cr, -sd·sr, cd),  e_ra = (-sr, cr, 0).
+        // We project onto the pole tangent plane (xy for both SCP and NCP),
+        // so only the x and y components matter — cos(dec) drops out.
+        float iu_x = -sd * cr * cR + sr * sR;
+        float iu_y = -sd * sr * cR - cr * sR;
+        // SCP chart's +y direction = ra=0 direction = (1, 0) in xy.
+        // NCP chart's +y direction = ra=π direction = (-1, 0) in xy
+        // (an extra π rotation, hence the negated arguments to atan2).
+        chart_roll = (true_pole_dec >= 0.0f)
+                   ? std::atan2(-iu_y, -iu_x)
+                   : std::atan2( iu_y,  iu_x);
+    }
 
     // Render stars + lines + center crosshair around the celestial pole. The
     // crosshair the renderer drops at the centre IS the true pole.
     PaCanvasAdapter adapter(canvas);
     star_map_.render(adapter, WIDTH, map_h,
-                     /*ra=*/0.0f, true_pole_dec, fov, cam_roll);
+                     /*ra=*/0.0f, true_pole_dec, fov, chart_roll);
 
     // Overlay the live mount-pole marker using the same scale the star map
     // used internally. scale_pix_per_rad = width / (2 * tan(fov/2)).
@@ -245,7 +281,7 @@ void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
         int cy = map_y0 + map_h / 2;
         int mx, my;
         if (gnomonic(pa_fix->live_pole.ra, pa_fix->live_pole.dec,
-                     0.0f, true_pole_dec, cam_roll, scale,
+                     0.0f, true_pole_dec, chart_roll, scale,
                      cx, cy, mx, my)) {
             if (mx >= 0 && mx < WIDTH && my >= map_y0 && my <= map_y1) {
                 // Hollow square (3x3) so the marker stands out from the

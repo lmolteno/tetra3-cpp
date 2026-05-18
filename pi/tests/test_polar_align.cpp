@@ -564,6 +564,114 @@ void test_pafix_tracker_detects_mount_adjustment() {
     CHECK(err_arcsec < 5.0, buf);
 }
 
+// Helpers shared with the chart-roll test below.
+namespace {
+struct CamPose { float ra, dec, roll; };
+
+// image-up direction in 3D (celestial frame). Matches the formula used in
+// tracker_view.cpp for chart_roll.
+std::array<double, 3> image_up_vec(const CamPose &c) {
+    double sd = std::sin(c.dec), cd = std::cos(c.dec);
+    double sr = std::sin(c.ra),  cr = std::cos(c.ra);
+    double cR = std::cos(c.roll), sR = std::sin(c.roll);
+    // image_up = e_dec * cR - e_ra * sR
+    //         = (-sd·cr·cR + sr·sR,  -sd·sr·cR - cr·sR,  cd·cR)
+    return { -sd*cr*cR + sr*sR,
+             -sd*sr*cR - cr*sR,
+              cd * cR };
+}
+
+double ang_between(const std::array<double, 3> &a,
+                   const std::array<double, 3> &b) {
+    double d = std::clamp(a[0]*b[0] + a[1]*b[1] + a[2]*b[2], -1.0, 1.0);
+    return std::acos(d);
+}
+
+// chart_roll for an SCP-centered chart, matching the formula in tracker_view.
+double chart_roll_scp(const CamPose &c) {
+    auto iu = image_up_vec(c);
+    return std::atan2(iu[1], iu[0]);
+}
+}  // anonymous
+
+// At SCP, the camera's physical image-up direction is determined by
+// (cam_ra - cam_roll). Two solver outputs that share the same (ra - roll)
+// but differ in ra and roll individually should yield the same chart roll.
+void test_chart_roll_pole_invariant_under_gimbal_lock() {
+    std::puts("test: chart_roll at SCP depends only on (cam_ra - cam_roll)");
+
+    // Two decompositions of the same physical orientation at dec = -89.99°.
+    // ra - roll = 0.10 in both.
+    CamPose ref{ 0.10f, -89.99f * float(DEG),  0.00f };
+    CamPose alt{ 0.30f, -89.99f * float(DEG),  0.20f };
+
+    // The image-up vectors are very close (small dec offset → small extra
+    // term in cd·cR which is irrelevant for the chart, which projects to
+    // the xy plane).
+    auto iu_ref = image_up_vec(ref);
+    auto iu_alt = image_up_vec(alt);
+    double err_arcsec = ang_between(iu_ref, iu_alt) * (180.0 * 3600.0 / M_PI);
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "image_up unchanged when ra-roll fixed near pole (err %.2f″)",
+                  err_arcsec);
+    CHECK(err_arcsec < 60.0, buf);
+
+    // The chart_roll values agree to within the same small residual.
+    double cr_ref = chart_roll_scp(ref);
+    double cr_alt = chart_roll_scp(alt);
+    double dcr_arcmin = std::fabs(cr_ref - cr_alt) * (180.0 * 60.0 / M_PI);
+    std::snprintf(buf, sizeof(buf),
+                  "chart_roll unchanged when ra-roll fixed near pole (Δ=%.3f')",
+                  dcr_arcmin);
+    CHECK(dcr_arcmin < 2.0, buf);
+}
+
+// Even more compelling: simulate the field-test failure mode. Near the
+// pole, plate-solve jitter splits between cam_ra and cam_roll randomly.
+// Show that chart_roll (the value we now feed into the chart projection)
+// is far more stable than cam_roll alone would be.
+void test_chart_roll_is_stable_under_pole_solve_jitter() {
+    std::puts("test: chart_roll near pole rides through ra/roll jitter");
+
+    // Camera near SCP, true physical (ra - roll) = 0.10.
+    std::mt19937 rng(1234);
+    // 50 mrad ≈ 2.9° of correlated jitter between ra and roll — what you
+    // get at dec ≈ -89.9° with a few arcsec of pointing noise on the
+    // underlying rotation matrix.
+    std::normal_distribution<double> jitter(0.0, 0.05);
+
+    double sum_chart_roll = 0, sum_chart_roll2 = 0;
+    double sum_cam_roll   = 0, sum_cam_roll2   = 0;
+    constexpr int N = 200;
+    for (int i = 0; i < N; ++i) {
+        double j = jitter(rng);
+        CamPose c{ static_cast<float>(0.10 + j),
+                   -89.95f * float(DEG),
+                   static_cast<float>(j) };          // ra-roll = 0.10
+        double cr = chart_roll_scp(c);
+        sum_chart_roll  += cr;
+        sum_chart_roll2 += cr * cr;
+        sum_cam_roll    += c.roll;
+        sum_cam_roll2   += c.roll * c.roll;
+    }
+    double mean_chart = sum_chart_roll / N;
+    double var_chart  = sum_chart_roll2 / N - mean_chart * mean_chart;
+    double std_chart_arcmin = std::sqrt(std::max(var_chart, 0.0))
+                            * (180.0 * 60.0 / M_PI);
+
+    double mean_cam   = sum_cam_roll / N;
+    double var_cam    = sum_cam_roll2 / N - mean_cam * mean_cam;
+    double std_cam_arcmin = std::sqrt(std::max(var_cam, 0.0))
+                          * (180.0 * 60.0 / M_PI);
+
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+                  "chart_roll σ=%.1f'  vs raw cam_roll σ=%.1f'  (>50× tighter)",
+                  std_chart_arcmin, std_cam_arcmin);
+    CHECK(std_chart_arcmin * 50.0 < std_cam_arcmin, buf);
+}
+
 void test_pafix_tracker_inactive_returns_invalid() {
     std::puts("test: PAFixTracker not started -> invalid live pole");
     PAFixTracker pa;
@@ -588,6 +696,8 @@ int main() {
     test_pafix_adjust_mount_does_not_reduce_numbers();
     test_pafix_mixed_arcs_corrupts_fit();
 
+    test_chart_roll_pole_invariant_under_gimbal_lock();
+    test_chart_roll_is_stable_under_pole_solve_jitter();
     test_pafix_tracker_inactive_returns_invalid();
     test_pafix_tracker_idle_returns_drifted_pole();
     test_pafix_tracker_detects_mount_adjustment();
