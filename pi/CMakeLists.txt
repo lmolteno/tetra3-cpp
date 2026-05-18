@@ -95,3 +95,12 @@ target_link_options(solve_cli PRIVATE -static)
 if(PI_NEON_ARMHF)
     target_compile_options(solve_cli PRIVATE -mfpu=neon-vfpv4)
 endif()
+
+# test_polar_align: synthetic-sample tests for the polar-alignment pipeline.
+# Self-contained — links only the polar_align translation unit, no solver, no
+# libcamera. Run directly: ./pi/test_polar_align
+add_executable(test_polar_align
+    tests/test_polar_align.cpp
+    src/app/polar_align.cpp
+)
+target_include_directories(test_polar_align PRIVATE src)

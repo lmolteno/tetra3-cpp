@@ -1,6 +1,7 @@
 #include "render/tracker_view.h"
 #include "render/text.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -16,7 +17,8 @@ struct StarMapAdapter : IStarMapCanvas {
 void TrackerView::render(ICanvas &canvas, AppMode mode,
                          const SolveResult &result,
                          const PolarAligner &aligner,
-                         const ImuHint *imu) {
+                         const ImuHint *imu,
+                         const PAFixState *pa_fix) {
     canvas.clear();
 
     switch (mode) {
@@ -29,9 +31,12 @@ void TrackerView::render(ICanvas &canvas, AppMode mode,
         break;
     }
     case AppMode::PAFix: {
-        auto pole = aligner.estimate_pole();
-        auto offset = aligner.pole_error(pole);
-        draw_pa_fix(canvas, offset);
+        // Prefer the live (tracker-updated) offset; fall back to the frozen
+        // fit if the tracker hasn't been initialised yet.
+        AltAzOffset offset = (pa_fix && pa_fix->live_pole.valid)
+                           ? pa_fix->live_offset
+                           : aligner.pole_error(aligner.estimate_pole());
+        draw_pa_fix(canvas, offset, pa_fix);
         break;
     }
     }
@@ -139,25 +144,147 @@ void TrackerView::draw_pa_sampling(ICanvas &canvas, int num_samples,
     text::draw(canvas, 1, COORD_Y, "SPC:sample ESC:done");
 }
 
-void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset) {
-    text::draw(canvas, 1, 0, "ADJUST MOUNT");
-    canvas.draw_hline(0, WIDTH - 1, 10);
+namespace {
 
+// Adapter used to overlay markers on top of a star map rendered into an
+// ICanvas (we only need draw_pixel from the marker side).
+struct PaCanvasAdapter : IStarMapCanvas {
+    ICanvas &canvas;
+    explicit PaCanvasAdapter(ICanvas &c) : canvas(c) {}
+    void draw_pixel(int x, int y) override { canvas.draw_pixel(x, y); }
+};
+
+// Gnomonic projection — identical to StarMapRenderer::project, replicated
+// here so we can reuse the *same* scale + roll the star map was just drawn
+// with and overlay a marker at the matching pixel.
+bool gnomonic(float ra, float dec,
+              float center_ra, float center_dec,
+              float roll, float scale,
+              int cx, int cy, int &px, int &py) {
+    float dra = ra - center_ra;
+    float sd  = std::sin(dec),     cd  = std::cos(dec);
+    float sd0 = std::sin(center_dec), cd0 = std::cos(center_dec);
+    float cdra = std::cos(dra),    sdra = std::sin(dra);
+    float cosc = sd0 * sd + cd0 * cd * cdra;
+    if (cosc <= 0.01f) return false;
+    float x = (cd * sdra) / cosc;
+    float y = (cd0 * sd - sd0 * cd * cdra) / cosc;
+    if (roll != 0.0f) {
+        float cr = std::cos(roll), sr = std::sin(roll);
+        float rx = x * cr - y * sr;
+        float ry = x * sr + y * cr;
+        x = rx; y = ry;
+    }
+    px = cx - static_cast<int>(x * scale + 0.5f);
+    py = cy - static_cast<int>(y * scale + 0.5f);
+    return true;
+}
+
+// Continuous autoscale for the pole-centered chart. We want the live
+// mount-pole marker to sit at roughly 1/4 of the chart radius from centre
+// regardless of how big the offset is, so FOV is set proportional to the
+// offset itself (FOV ≈ 8·offset → marker at 64/8 ≈ 8 px from centre, about
+// 36% of the 22-px vertical chart half-height). Clamped at the small end so
+// the star map still has stars to anchor against (Octans / UMi are sparse
+// below ~5'), and at the large end so a wildly-bad initial fit doesn't blow
+// the projection up.
+float autoscale_fov_rad(float total_arcmin) {
+    constexpr float ARCMIN = static_cast<float>(M_PI) / (180.0f * 60.0f);
+    float f = 8.0f * total_arcmin;
+    if (f <    5.0f) f =    5.0f;   //  min 5'   FOV — keep stars in frame
+    if (f > 3600.0f) f = 3600.0f;   //  max 60°  FOV
+    return f * ARCMIN;
+}
+
+void format_fov_label(float fov_rad, char *out, size_t n) {
+    float arcmin = fov_rad * (180.0f * 60.0f / static_cast<float>(M_PI));
+    if (arcmin < 60.0f) snprintf(out, n, "%.0f'", arcmin);
+    else                snprintf(out, n, "%.1f\xB0", arcmin / 60.0f);
+}
+
+}  // namespace
+
+void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
+                              const PAFixState *pa_fix) {
+    // Layout: pole-centered star map fills the top of the screen, the live
+    // mount-pole marker sits on top of it, and the numerical offset is shown
+    // below. The map uses the SAME projection (gnomonic via StarMapRenderer)
+    // and the SAME camera roll, so the orientation matches what the operator
+    // sees through the camera — they can correlate stars on-screen with what
+    // they see in the camera view, regardless of where the camera is pointed.
+    const int map_h = 45;             // y: 0 .. 44
+    const int map_y0 = 0, map_y1 = map_h - 1;
+
+    // Pick the true celestial pole — north or south based on observer lat.
+    // Fall back to south if we have no PAFixState (compile-time default at
+    // OBSERVER_LAT_DEG = -33.86 → southern hemisphere).
+    float observer_lat = pa_fix ? pa_fix->observer_lat
+                                : static_cast<float>(OBSERVER_LAT_DEG)
+                                  * static_cast<float>(M_PI) / 180.0f;
+    float true_pole_dec = (observer_lat >= 0.0f)
+                        ?  static_cast<float>(M_PI / 2)
+                        : -static_cast<float>(M_PI / 2);
+
+    // Autoscale FOV so the mount-pole marker doesn't get buried. As the
+    // operator drives the offset down, the chart zooms in.
+    float fov = autoscale_fov_rad(offset.total_arcmin);
+    float cam_roll = pa_fix ? pa_fix->cam_roll : 0.0f;
+
+    // Render stars + lines + center crosshair around the celestial pole. The
+    // crosshair the renderer drops at the centre IS the true pole.
+    PaCanvasAdapter adapter(canvas);
+    star_map_.render(adapter, WIDTH, map_h,
+                     /*ra=*/0.0f, true_pole_dec, fov, cam_roll);
+
+    // Overlay the live mount-pole marker using the same scale the star map
+    // used internally. scale_pix_per_rad = width / (2 * tan(fov/2)).
+    if (pa_fix && pa_fix->live_pole.valid) {
+        float scale = static_cast<float>(WIDTH) /
+                      (2.0f * std::tan(fov / 2.0f));
+        int cx = WIDTH / 2;
+        int cy = map_y0 + map_h / 2;
+        int mx, my;
+        if (gnomonic(pa_fix->live_pole.ra, pa_fix->live_pole.dec,
+                     0.0f, true_pole_dec, cam_roll, scale,
+                     cx, cy, mx, my)) {
+            if (mx >= 0 && mx < WIDTH && my >= map_y0 && my <= map_y1) {
+                // Hollow square (3x3) so the marker stands out from the
+                // single-pixel star dots: corners + middle of each side.
+                canvas.draw_pixel(mx - 1, my - 1);
+                canvas.draw_pixel(mx + 1, my - 1);
+                canvas.draw_pixel(mx - 1, my + 1);
+                canvas.draw_pixel(mx + 1, my + 1);
+                canvas.draw_pixel(mx,     my - 1);
+                canvas.draw_pixel(mx,     my + 1);
+                canvas.draw_pixel(mx - 1, my);
+                canvas.draw_pixel(mx + 1, my);
+            } else {
+                // Off-screen at this zoom — draw an edge arrow pointing at it.
+                int ex = std::clamp(mx, 1, WIDTH - 2);
+                int ey = std::clamp(my, map_y0 + 1, map_y1 - 1);
+                canvas.draw_pixel(ex, ey);
+                canvas.draw_pixel(ex - 1, ey);
+                canvas.draw_pixel(ex + 1, ey);
+                canvas.draw_pixel(ex, ey - 1);
+                canvas.draw_pixel(ex, ey + 1);
+            }
+        }
+    }
+
+    // Scale label (left) + numerical offset (right).
     char buf[24];
-    char alt_sign = offset.alt_arcmin >= 0 ? '+' : '-';
-    float alt_abs = std::fabs(offset.alt_arcmin);
-    snprintf(buf, sizeof(buf), "Alt: %c%.1f'", alt_sign, alt_abs);
-    text::draw(canvas, 1, 16, buf, /*large=*/true);
+    char lbl[12];
+    format_fov_label(fov, lbl, sizeof(lbl));
+    snprintf(buf, sizeof(buf), "FOV %s", lbl);
+    text::draw(canvas, 1, 47, buf);
+    snprintf(buf, sizeof(buf), "%+.1f' %+.1f' T%.1f'",
+             offset.alt_arcmin, offset.az_arcmin, offset.total_arcmin);
+    // 22 chars max at 6 px per glyph = 132 px → too wide. Compact form:
+    snprintf(buf, sizeof(buf), "%+.1f'/%+.1f'", offset.alt_arcmin,
+             offset.az_arcmin);
+    text::draw(canvas, 56, 47, buf);
+    snprintf(buf, sizeof(buf), "T%.1f'", offset.total_arcmin);
+    text::draw(canvas, 1, 56, buf, /*large=*/true);
 
-    char az_sign = offset.az_arcmin >= 0 ? '+' : '-';
-    float az_abs = std::fabs(offset.az_arcmin);
-    snprintf(buf, sizeof(buf), "Az:  %c%.1f'", az_sign, az_abs);
-    text::draw(canvas, 1, 32, buf, /*large=*/true);
-
-    canvas.draw_hline(0, WIDTH - 1, 46);
-    snprintf(buf, sizeof(buf), "Total: %.1f'", offset.total_arcmin);
-    text::draw(canvas, 1, 48, buf);
-
-    canvas.draw_hline(0, WIDTH - 1, 55);
-    text::draw(canvas, 1, COORD_Y, "SPC:resample ESC:ok");
+    text::draw(canvas, 80, COORD_Y, "SPC/ESC");
 }

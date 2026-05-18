@@ -169,6 +169,88 @@ void PolarAligner::eq_to_altaz(float ra, float dec, double lst,
     az = std::atan2(sin_az, cos_az);
 }
 
+// ----------------------------------------------------------------------------
+// PAFixTracker
+
+void PAFixTracker::start(float pole_ra, float pole_dec,
+                          float cam_ra, float cam_dec,
+                          double t_seconds) {
+    pole0_ra_  = pole_ra;
+    pole0_dec_ = pole_dec;
+    cam0_ra_   = cam_ra;
+    cam0_dec_  = cam_dec;
+    t0_        = t_seconds;
+    active_    = true;
+}
+
+void PAFixTracker::stop() { active_ = false; }
+
+namespace {
+struct V3 { double x, y, z; };
+V3 to_vec(double ra, double dec) {
+    double cd = std::cos(dec);
+    return { cd * std::cos(ra), cd * std::sin(ra), std::sin(dec) };
+}
+V3 cross(const V3 &a, const V3 &b) {
+    return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+double dot(const V3 &a, const V3 &b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+double norm(const V3 &a) { return std::sqrt(dot(a, a)); }
+}  // namespace
+
+PoleEstimate PAFixTracker::live_pole(float cam_ra_now, float cam_dec_now,
+                                      double t_seconds) const {
+    PoleEstimate out;
+    if (!active_) return out;
+
+    // The mount is fixed in the horizontal frame; in equatorial coords it
+    // drifts at +sidereal_rate in RA. Predict where the snapshotted pole and
+    // camera would be at t_now if the operator hadn't touched anything.
+    double dt = t_seconds - t0_;
+    double pred_pole_ra = pole0_ra_ + SIDEREAL_RATE * dt;
+    double pred_cam_ra  = cam0_ra_  + SIDEREAL_RATE * dt;
+
+    V3 vec_pred_cam  = to_vec(pred_cam_ra, cam0_dec_);
+    V3 vec_now_cam   = to_vec(cam_ra_now,  cam_dec_now);
+    V3 vec_pred_pole = to_vec(pred_pole_ra, pole0_dec_);
+
+    // No-twist rotation taking pred_cam -> now_cam. axis = pred_cam x now_cam;
+    // angle = atan2(|axis|, pred_cam . now_cam).
+    V3 axis = cross(vec_pred_cam, vec_now_cam);
+    double s = norm(axis);
+    double c = dot(vec_pred_cam, vec_now_cam);
+
+    V3 live_vec;
+    if (s < 1e-12) {
+        // Camera is at (or extremely near) the predicted-no-move position —
+        // operator hasn't touched the mount yet. Live pole = predicted pole.
+        live_vec = vec_pred_pole;
+    } else {
+        axis.x /= s; axis.y /= s; axis.z /= s;
+        double angle = std::atan2(s, c);
+        double ca = std::cos(angle);
+        double sa = std::sin(angle);
+        double dotAP = dot(axis, vec_pred_pole);
+        V3 crs = cross(axis, vec_pred_pole);
+        live_vec = {
+            vec_pred_pole.x * ca + crs.x * sa + axis.x * dotAP * (1 - ca),
+            vec_pred_pole.y * ca + crs.y * sa + axis.y * dotAP * (1 - ca),
+            vec_pred_pole.z * ca + crs.z * sa + axis.z * dotAP * (1 - ca),
+        };
+    }
+
+    out.valid   = true;
+    out.dec     = static_cast<float>(std::asin(std::clamp(live_vec.z, -1.0, 1.0)));
+    out.ra      = static_cast<float>(std::atan2(live_vec.y, live_vec.x));
+    if (out.ra < 0) out.ra += 2.0f * static_cast<float>(M_PI);
+    out.arc_deg = 0;  // not meaningful for live tracker
+    return out;
+}
+
+// ----------------------------------------------------------------------------
+
 AltAzOffset PolarAligner::pole_error(const PoleEstimate &pole) const {
     if (!pole.valid) return {};
 

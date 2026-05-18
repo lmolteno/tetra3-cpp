@@ -232,7 +232,9 @@ int main(int argc, char *argv[]) {
         }
     }
     PolarAligner aligner(cfg.lat, cfg.lon);
+    PAFixTracker pa_tracker;
     AppMode mode = AppMode::Tracking;
+    AppMode prev_mode = mode;
     ControlInput input;
 
     std::unique_ptr<imu::ImuTracker> imu_tracker;
@@ -426,8 +428,11 @@ int main(int argc, char *argv[]) {
                 last_solve_timing.match      = last_result.solve_time_ms;
                 last_solve_timing.solve_wall = rs->wall_ms;
                 last_result_at = rs->received_at;
-                if (last_result.solved &&
-                    (mode == AppMode::PASampling || mode == AppMode::PAFix)) {
+                // Sampling only happens in PASampling. PAFix freezes the
+                // sample buffer and reads live updates from PAFixTracker
+                // instead — mixing in post-adjustment samples would corrupt
+                // the small-circle fit.
+                if (last_result.solved && mode == AppMode::PASampling) {
                     aligner.add_sample(last_result.ra, last_result.dec, now_steady());
                 }
                 if (last_result.solved && imu_tracker) {
@@ -437,11 +442,35 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // 4b. Mode-edge handling for PAFix live tracker. On entry, snapshot
+        //     the fitted pole + the camera direction; on exit, deactivate.
+        if (prev_mode != AppMode::PAFix && mode == AppMode::PAFix) {
+            auto entry_pole = aligner.estimate_pole();
+            if (entry_pole.valid && last_result.solved) {
+                pa_tracker.start(entry_pole.ra, entry_pole.dec,
+                                 last_result.ra, last_result.dec,
+                                 now_steady());
+            }
+        } else if (prev_mode == AppMode::PAFix && mode != AppMode::PAFix) {
+            pa_tracker.stop();
+        }
+        prev_mode = mode;
+
         // 5. Render + publish. We render every tick (even if no fresh frame
         //    arrived) so commands and solver results show up at publish rate.
         SolveResult display_result = last_result;
         if (display_result.solved && cfg.roll_offset_deg != 0.0f)
             display_result.roll += cfg.roll_offset_deg * float(M_PI) / 180.0f;
+
+        // PAFix live pole: while in PAFix, use the tracker to follow the
+        // operator's alt/az knob adjustments without re-running the fit.
+        PoleEstimate pa_live_pole{};
+        AltAzOffset  pa_live_offset{};
+        if (mode == AppMode::PAFix && pa_tracker.active() && last_result.solved) {
+            pa_live_pole   = pa_tracker.live_pole(last_result.ra, last_result.dec,
+                                                  now_steady());
+            pa_live_offset = aligner.pole_error(pa_live_pole);
+        }
 
         std::optional<imu::Pointing> imu_pt;
         if (imu_tracker) imu_pt = imu_tracker->get_pointing();
@@ -461,7 +490,18 @@ int main(int argc, char *argv[]) {
             imu_hint.calibrated = imu_pt->calibrated;
             imu_hint_ptr = &imu_hint;
         }
-        view.render(canvas, mode, display_result, aligner, imu_hint_ptr);
+        PAFixState pa_fix_state;
+        const PAFixState *pa_fix_ptr = nullptr;
+        if (mode == AppMode::PAFix && pa_live_pole.valid && last_result.solved) {
+            pa_fix_state.live_pole    = pa_live_pole;
+            pa_fix_state.live_offset  = pa_live_offset;
+            pa_fix_state.cam_ra       = last_result.ra;
+            pa_fix_state.cam_dec      = last_result.dec;
+            pa_fix_state.cam_roll     = display_result.roll;  // includes roll_offset
+            pa_fix_state.observer_lat = cfg.lat * static_cast<float>(M_PI) / 180.0f;
+            pa_fix_ptr = &pa_fix_state;
+        }
+        view.render(canvas, mode, display_result, aligner, imu_hint_ptr, pa_fix_ptr);
         if (oled) {
             try { oled->flush(canvas.framebuffer()); }
             catch (const std::exception &e) {
