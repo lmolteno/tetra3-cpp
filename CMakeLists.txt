@@ -6,19 +6,12 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Prefer the static zlib so binaries can be statically linked against it.
+# Prefer static zlib so the Pi binaries can be statically linked against it.
 # Falls through to .so if the static build isn't installed.
 set(ZLIB_USE_STATIC_LIBS ON)
 
-# Build the shared solver library
+# Plate-solver library — used by every target.
 add_subdirectory(lib/solver)
 
-# Original test executable
-find_package(ZLIB REQUIRED)
-find_package(Eigen3 REQUIRED)
-
-add_executable(solver main.cpp)
-target_link_libraries(solver PRIVATE tetra3_solver)
-
-# Pi tracker app
+# Pi tracker daemon + solve_cli + oled_test + tests.
 add_subdirectory(pi)
