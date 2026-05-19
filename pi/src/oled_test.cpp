@@ -141,48 +141,61 @@ int main(int argc, char *argv[]) {
         show(canvas, oled.get(), "PA fix: alt/az correction (no live state)");
     }
 
-    // Polar-alignment fix — with live tracker state. Shows the chart.
+    // Polar-alignment fix — with live tracker state. Shows the new
+    // camera-centred chart at fixed 5° FOV. Camera points near the SCP
+    // (where a real operator would have the mount set), and the marker
+    // is the real celestial pole's projected position. Arrow goes from
+    // the chart centre toward the pole — driving it to the centre means
+    // the mount is polar-aligned.
+    constexpr float NEAR_POLE_RA  = 0.0f;
+    constexpr float NEAR_POLE_DEC = -89.5f * float(M_PI) / 180.0f;
     {
         auto pa = make_pa(-80.0f, 4);
         PAFixState pf{};
         pf.live_pole.valid = true;
-        // Live mount pole ~15' below the SCP and slightly east in RA.
         pf.live_pole.ra  = 10.0f * float(M_PI) / 180.0f;
-        pf.live_pole.dec = (-90.0f + 0.25f) * float(M_PI) / 180.0f;  // 15'
+        pf.live_pole.dec = (-90.0f + 0.25f) * float(M_PI) / 180.0f;
         pf.live_offset.alt_arcmin   = -12.4f;
         pf.live_offset.az_arcmin    =   8.7f;
         pf.live_offset.total_arcmin = 15.1f;
-        pf.cam_ra       = SC_RA;
-        pf.cam_dec      = SC_DEC;
+        pf.cam_ra       = NEAR_POLE_RA;
+        pf.cam_dec      = NEAR_POLE_DEC;
         pf.cam_roll     = 0.0f;
         pf.observer_lat = OBSERVER_LAT_DEG * float(M_PI) / 180.0f;
         view.render(canvas, AppMode::PAFix, solved, pa, nullptr, &pf);
         show(canvas, oled.get(), "PA fix: live chart (~15' total)");
     }
 
-    // PA fix near-perfect alignment — autoscale zooms in to a 5' or 2' FOV.
-    auto pa_fix_demo = [&](float total_arcmin, float dec_offset_deg,
+    // PA fix sweep at various offsets — pole-marker walks toward centre
+    // as alignment improves.
+    auto pa_fix_demo = [&](float total_arcmin, float cam_dec_offset_deg,
                            const char *label) {
         auto pa = make_pa(-80.0f, 4);
         PAFixState pf{};
         pf.live_pole.valid = true;
         pf.live_pole.ra    = 0.0f;
-        pf.live_pole.dec   = (-90.0f + dec_offset_deg) * float(M_PI) / 180.0f;
+        pf.live_pole.dec   = -89.5f * float(M_PI) / 180.0f;
         pf.live_offset.alt_arcmin   = -0.6f * total_arcmin;
         pf.live_offset.az_arcmin    =  0.4f * total_arcmin;
         pf.live_offset.total_arcmin = total_arcmin;
-        pf.cam_ra       = SC_RA;
-        pf.cam_dec      = SC_DEC;
+        // Camera near the pole, offset from it by cam_dec_offset_deg.
+        // This sets where the real-pole marker ends up on the chart.
+        pf.cam_ra       = 0.0f;
+        pf.cam_dec      = (-90.0f + cam_dec_offset_deg) * float(M_PI) / 180.0f;
         pf.cam_roll     = 0.0f;
         pf.observer_lat = OBSERVER_LAT_DEG * float(M_PI) / 180.0f;
         view.render(canvas, AppMode::PAFix, solved, pa, nullptr, &pf);
         show(canvas, oled.get(), label);
     };
 
-    pa_fix_demo(0.7f,  0.012f, "PA fix: ~0.7' offset  (autoscale 6')");
-    pa_fix_demo(2.0f,  0.033f, "PA fix: ~2' offset    (autoscale 1°)");
-    pa_fix_demo(8.0f,  0.133f, "PA fix: ~8' offset    (autoscale 3°)");
-    pa_fix_demo(45.0f, 0.75f,  "PA fix: ~45' offset   (autoscale 30°)");
+    // Pole-marker distance from chart centre = camera's offset from the
+    // real pole. As the operator aligns the mount and slews the camera
+    // toward the pole, the marker walks in.
+    pa_fix_demo(0.7f, 0.01f,  "PA fix: marker ~0.04° from centre (~0.7' err)");
+    pa_fix_demo(2.0f, 0.1f,   "PA fix: marker ~0.1° from centre (~2' err)");
+    pa_fix_demo(8.0f, 0.5f,   "PA fix: marker ~0.5° from centre (~8' err)");
+    pa_fix_demo(45.0f, 2.0f,  "PA fix: marker ~2° from centre (~45' err)");
+    pa_fix_demo(100.0f, 8.0f, "PA fix: marker off-chart (~100' err, edge arrow)");
 
     return 0;
 }

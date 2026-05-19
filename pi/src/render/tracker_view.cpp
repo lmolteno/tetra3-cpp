@@ -180,44 +180,55 @@ bool gnomonic(float ra, float dec,
     return true;
 }
 
-// Continuous autoscale for the pole-centered chart. We want the live
-// mount-pole marker to sit at roughly 1/4 of the chart radius from centre
-// regardless of how big the offset is, so FOV is set proportional to the
-// offset itself (FOV ≈ 8·offset → marker at 64/8 ≈ 8 px from centre, about
-// 36% of the 22-px vertical chart half-height). Clamped at the small end so
-// the star map still has stars to anchor against (Octans / UMi are sparse
-// below ~5'), and at the large end so a wildly-bad initial fit doesn't blow
-// the projection up.
-float autoscale_fov_rad(float total_arcmin) {
-    constexpr float ARCMIN = static_cast<float>(M_PI) / (180.0f * 60.0f);
-    float f = 8.0f * total_arcmin;
-    if (f <    5.0f) f =    5.0f;   //  min 5'   FOV — keep stars in frame
-    if (f > 3600.0f) f = 3600.0f;   //  max 60°  FOV
-    return f * ARCMIN;
+// Bresenham line + small arrowhead. Used to draw "move the mount this way"
+// from the chart centre to wherever the real pole is projecting.
+void draw_line(ICanvas &c, int x0, int y0, int x1, int y1) {
+    int dx = std::abs(x1 - x0), dy = std::abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    while (true) {
+        c.draw_pixel(x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
 }
 
-void format_fov_label(float fov_rad, char *out, size_t n) {
-    float arcmin = fov_rad * (180.0f * 60.0f / static_cast<float>(M_PI));
-    if (arcmin < 60.0f) snprintf(out, n, "%.0f'", arcmin);
-    else                snprintf(out, n, "%.1f\xB0", arcmin / 60.0f);
+// 5-pixel arrowhead at (tx, ty), pointing along unit direction (ux, uy).
+// (tx, ty) is the tip. The two "fins" sit ~3 px back along -direction and
+// 2 px perpendicular.
+void draw_arrowhead(ICanvas &c, int tx, int ty, float ux, float uy) {
+    auto round = [](float v) { return static_cast<int>(v + (v >= 0 ? 0.5f : -0.5f)); };
+    float px = -uy, py = ux;          // perpendicular
+    int bx = tx - round(3.0f * ux);
+    int by = ty - round(3.0f * uy);
+    int lx = bx + round(2.0f * px), ly = by + round(2.0f * py);
+    int rx = bx - round(2.0f * px), ry = by - round(2.0f * py);
+    draw_line(c, tx, ty, lx, ly);
+    draw_line(c, tx, ty, rx, ry);
 }
 
 }  // namespace
 
 void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
                               const PAFixState *pa_fix) {
-    // Layout: pole-centered star map fills the top of the screen, the live
-    // mount-pole marker sits on top of it, and the numerical offset is shown
-    // below. The map uses the SAME projection (gnomonic via StarMapRenderer)
-    // and the SAME camera roll, so the orientation matches what the operator
-    // sees through the camera — they can correlate stars on-screen with what
-    // they see in the camera view, regardless of where the camera is pointed.
-    const int map_h = 45;             // y: 0 .. 44
-    const int map_y0 = 0, map_y1 = map_h - 1;
+    // Camera-centred chart at a fixed 5° FOV. The star field is drawn around
+    // the camera's actual pointing (with the camera's actual roll), so the
+    // operator sees the patch of sky the camera is on. The real celestial
+    // pole is drawn as a target marker; an arrow goes from chart centre
+    // toward it. As alignment improves, the mount slews the camera toward
+    // the pole, the marker walks in toward the centre, and the arrow
+    // shortens. When the marker is at the centre the mount points at the
+    // real pole — i.e. it's polar-aligned.
+    constexpr int CHART_H = 48;                  // y: 0 .. 47
+    constexpr int CHART_Y0 = 0;
+    constexpr int CHART_Y1 = CHART_H - 1;
+    constexpr float FOV_RAD =
+        5.0f * static_cast<float>(M_PI) / 180.0f;
 
-    // Pick the true celestial pole — north or south based on observer lat.
-    // Fall back to south if we have no PAFixState (compile-time default at
-    // OBSERVER_LAT_DEG = -33.86 → southern hemisphere).
+    // Default to south if no state — matches the OBSERVER_LAT_DEG compile
+    // default. With a PAFixState this is unused except for picking the pole.
     float observer_lat = pa_fix ? pa_fix->observer_lat
                                 : static_cast<float>(OBSERVER_LAT_DEG)
                                   * static_cast<float>(M_PI) / 180.0f;
@@ -225,102 +236,84 @@ void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
                         ?  static_cast<float>(M_PI / 2)
                         : -static_cast<float>(M_PI / 2);
 
-    // Autoscale FOV so the mount-pole marker doesn't get buried. As the
-    // operator drives the offset down, the chart zooms in.
-    float fov = autoscale_fov_rad(offset.total_arcmin);
+    float cam_ra   = pa_fix ? pa_fix->cam_ra   : 0.0f;
+    float cam_dec  = pa_fix ? pa_fix->cam_dec  : 0.0f;
+    float cam_roll = pa_fix ? pa_fix->cam_roll : 0.0f;
 
-    // Chart roll: the (ra, dec, roll) parameterisation of camera orientation
-    // has a gimbal-lock singularity at the celestial pole — cos(dec) ≈ 0
-    // there, so atan2-deriving ra from the rotation matrix amplifies small
-    // numerical perturbations into large ra fluctuations (and a coupled
-    // anti-fluctuation in roll). The physical orientation is fine; only the
-    // parameterisation is bad. The chart suffers if we plug cam_roll into
-    // the projection's roll slot directly, because the chart is centred on
-    // a different point than the camera and so cam_roll alone isn't the
-    // right rotation.
-    //
-    // What *is* well-defined everywhere is the camera's image-up vector in
-    // 3D — a unit tangent to the celestial sphere at the camera's pointing
-    // direction. We project that onto the pole's tangent plane and take its
-    // angle: that gives the roll that makes screen-up on the chart match
-    // image-up in the camera view. Near the pole the formula collapses to
-    // the (ra ∓ roll) gimbal-lock-invariant combination (− for SCP, + for
-    // NCP), so the chart sits still even though cam_ra and cam_roll wobble
-    // individually.
-    float chart_roll = 0.0f;
-    if (pa_fix) {
-        float sd = std::sin(pa_fix->cam_dec);
-        float sr = std::sin(pa_fix->cam_ra),  cr = std::cos(pa_fix->cam_ra);
-        float cR = std::cos(pa_fix->cam_roll), sR = std::sin(pa_fix->cam_roll);
-        // image_up_3D = e_dec * cos(roll) − e_ra * sin(roll),
-        //   e_dec = (-sd·cr, -sd·sr, cd),  e_ra = (-sr, cr, 0).
-        // We project onto the pole tangent plane (xy for both SCP and NCP),
-        // so only the x and y components matter — cos(dec) drops out.
-        float iu_x = -sd * cr * cR + sr * sR;
-        float iu_y = -sd * sr * cR - cr * sR;
-        // SCP chart's +y direction = ra=0 direction = (1, 0) in xy.
-        // NCP chart's +y direction = ra=π direction = (-1, 0) in xy
-        // (an extra π rotation, hence the negated arguments to atan2).
-        chart_roll = (true_pole_dec >= 0.0f)
-                   ? std::atan2(-iu_y, -iu_x)
-                   : std::atan2( iu_y,  iu_x);
-    }
-
-    // Render stars + lines + center crosshair around the celestial pole. The
-    // crosshair the renderer drops at the centre IS the true pole.
+    // Star field at the camera's current pointing. Camera roll = chart roll
+    // here (chart is centred on the camera, no parallel-transport needed).
     PaCanvasAdapter adapter(canvas);
-    star_map_.render(adapter, WIDTH, map_h,
-                     /*ra=*/0.0f, true_pole_dec, fov, chart_roll);
+    star_map_.render(adapter, WIDTH, CHART_H,
+                     cam_ra, cam_dec, FOV_RAD, cam_roll);
 
-    // Overlay the live mount-pole marker using the same scale the star map
-    // used internally. scale_pix_per_rad = width / (2 * tan(fov/2)).
-    if (pa_fix && pa_fix->live_pole.valid) {
-        float scale = static_cast<float>(WIDTH) /
-                      (2.0f * std::tan(fov / 2.0f));
-        int cx = WIDTH / 2;
-        int cy = map_y0 + map_h / 2;
-        int mx, my;
-        if (gnomonic(pa_fix->live_pole.ra, pa_fix->live_pole.dec,
-                     0.0f, true_pole_dec, chart_roll, scale,
-                     cx, cy, mx, my)) {
-            if (mx >= 0 && mx < WIDTH && my >= map_y0 && my <= map_y1) {
-                // Hollow square (3x3) so the marker stands out from the
-                // single-pixel star dots: corners + middle of each side.
-                canvas.draw_pixel(mx - 1, my - 1);
-                canvas.draw_pixel(mx + 1, my - 1);
-                canvas.draw_pixel(mx - 1, my + 1);
-                canvas.draw_pixel(mx + 1, my + 1);
-                canvas.draw_pixel(mx,     my - 1);
-                canvas.draw_pixel(mx,     my + 1);
-                canvas.draw_pixel(mx - 1, my);
-                canvas.draw_pixel(mx + 1, my);
-            } else {
-                // Off-screen at this zoom — draw an edge arrow pointing at it.
-                int ex = std::clamp(mx, 1, WIDTH - 2);
-                int ey = std::clamp(my, map_y0 + 1, map_y1 - 1);
-                canvas.draw_pixel(ex, ey);
-                canvas.draw_pixel(ex - 1, ey);
-                canvas.draw_pixel(ex + 1, ey);
-                canvas.draw_pixel(ex, ey - 1);
-                canvas.draw_pixel(ex, ey + 1);
-            }
+    // Project the real celestial pole into chart space.
+    int cx = WIDTH / 2;
+    int cy = CHART_Y0 + CHART_H / 2;
+    const float scale =
+        static_cast<float>(WIDTH) / (2.0f * std::tan(FOV_RAD / 2.0f));
+    int px, py;
+    bool projected = gnomonic(0.0f, true_pole_dec,
+                              cam_ra, cam_dec, cam_roll, scale,
+                              cx, cy, px, py);
+
+    if (projected) {
+        const int MARGIN = 4;
+        bool on_chart = (px >= MARGIN && px < WIDTH - MARGIN &&
+                         py >= CHART_Y0 + MARGIN && py <= CHART_Y1 - MARGIN);
+        int tip_x = px, tip_y = py;
+        if (!on_chart) {
+            // Clamp to a point near the edge, on the line from centre to
+            // the pole's projected position. Arrow lives at the edge.
+            float dx = static_cast<float>(px - cx);
+            float dy = static_cast<float>(py - cy);
+            float len = std::sqrt(dx * dx + dy * dy);
+            if (len < 1.0f) { dx = 1.0f; dy = 0.0f; len = 1.0f; }
+            float ux = dx / len, uy = dy / len;
+            int max_x = WIDTH / 2 - MARGIN;
+            int max_y = CHART_H / 2 - MARGIN;
+            float r = std::min(static_cast<float>(max_x) / std::fabs(ux + 1e-6f),
+                                static_cast<float>(max_y) / std::fabs(uy + 1e-6f));
+            tip_x = cx + static_cast<int>(ux * r + 0.5f);
+            tip_y = cy + static_cast<int>(uy * r + 0.5f);
+        }
+
+        // Shaft from centre to tip + arrowhead at the tip. As alignment
+        // improves the shaft gets shorter.
+        if (std::abs(tip_x - cx) > 1 || std::abs(tip_y - cy) > 1) {
+            draw_line(canvas, cx, cy, tip_x, tip_y);
+            float dx = static_cast<float>(tip_x - cx);
+            float dy = static_cast<float>(tip_y - cy);
+            float len = std::sqrt(dx * dx + dy * dy);
+            draw_arrowhead(canvas, tip_x, tip_y, dx / len, dy / len);
+        }
+
+        if (on_chart) {
+            // Target marker: small hollow square at the projected pole.
+            // (When the camera is exactly on the real pole, this lands on
+            // top of the star-map crosshair and reinforces "you're here".)
+            canvas.draw_pixel(px - 1, py - 1);
+            canvas.draw_pixel(px,     py - 1);
+            canvas.draw_pixel(px + 1, py - 1);
+            canvas.draw_pixel(px - 1, py);
+            canvas.draw_pixel(px + 1, py);
+            canvas.draw_pixel(px - 1, py + 1);
+            canvas.draw_pixel(px,     py + 1);
+            canvas.draw_pixel(px + 1, py + 1);
         }
     }
 
-    // Scale label (left) + numerical offset (right).
-    char buf[24];
-    char lbl[12];
-    format_fov_label(fov, lbl, sizeof(lbl));
-    snprintf(buf, sizeof(buf), "FOV %s", lbl);
-    text::draw(canvas, 1, 47, buf);
-    snprintf(buf, sizeof(buf), "%+.1f' %+.1f' T%.1f'",
-             offset.alt_arcmin, offset.az_arcmin, offset.total_arcmin);
-    // 22 chars max at 6 px per glyph = 132 px → too wide. Compact form:
-    snprintf(buf, sizeof(buf), "%+.1f'/%+.1f'", offset.alt_arcmin,
-             offset.az_arcmin);
-    text::draw(canvas, 56, 47, buf);
-    snprintf(buf, sizeof(buf), "T%.1f'", offset.total_arcmin);
-    text::draw(canvas, 1, 56, buf, /*large=*/true);
-
-    text::draw(canvas, 80, COORD_Y, "SPC/ESC");
+    // Bottom strip: alt/az breakdown on one line, total on the next. All
+    // small text so nothing clips off the bottom of the 64-px screen.
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%+5.1f' %+5.1f'",
+             offset.alt_arcmin, offset.az_arcmin);
+    text::draw(canvas, 1, 49, buf);
+    // Cap the total at the visible cell width so absurd values from a bad
+    // fit don't spill into "SPC/ESC".
+    if (offset.total_arcmin >= 999.5f)
+        snprintf(buf, sizeof(buf), "T>999'");
+    else
+        snprintf(buf, sizeof(buf), "T%5.1f'", offset.total_arcmin);
+    text::draw(canvas, 1, 57, buf);
+    text::draw(canvas, 80, 57, "SPC/ESC");
 }
