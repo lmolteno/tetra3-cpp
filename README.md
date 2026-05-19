@@ -73,9 +73,26 @@ The terminal viewer renders it:
 
 ## Catalogs
 
-The committed `tetra3_db_*.bin` files are built from Hipparcos/BSC. To
-regenerate them yourself, see `generate_catalog_headers.py` and
-`to_binary.py`.
+The solver loads two binary files at runtime:
+
+- `tetra3_db_stars.bin` — flat array of `(ra, dec, x, y, z, mag)` floats.
+- `tetra3_db_patterns.bin` — hash table of 4-star pattern indices into
+  the star table, ~100 MB at mag-7. Too large to keep in git; build it
+  locally with:
+
+```sh
+git clone https://github.com/esa/tetra3 ../tetra3   # one-time
+tools/star_catalog/.venv/bin/python to_binary.py \
+    ../tetra3/tetra3/data/default_database.npz
+```
+
+`to_binary.py` with no argument also auto-locates the bundled
+`default_database.npz` from common clone paths or an installed
+`tetra3` package. The result is the same catalog tetra3 itself uses —
+8818 stars to magnitude 7, ~12 M 4-star patterns for FOVs in 10°–30°.
+
+`generate_catalog_headers.py` builds smaller catalogs flashed directly
+into the ESP32 firmware (`esp/`).
 
 ## Tests
 

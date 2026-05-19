@@ -14,3 +14,9 @@ __pycache__/
 tools/star_catalog/.cache/
 tools/star_catalog/.venv/
 tools/star_catalog/coverage_results.json
+
+# Built catalog. Regenerate from the upstream tetra3 .npz with
+#   tools/star_catalog/.venv/bin/python to_binary.py
+# (see README). At mag-7 it's ~100 MB and shouldn't live in git.
+tetra3_db_patterns.bin
+tetra3_db_stars.bin
