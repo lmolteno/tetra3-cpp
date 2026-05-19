@@ -4,3 +4,4 @@ astroquery
 Pillow
 textual
 websockets
+aiohttp
