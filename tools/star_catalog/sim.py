@@ -161,13 +161,28 @@ class Sim:
         self.exposure_ms   = args.exposure_ms
         self.gain          = args.gain
 
-        # Mount state. When mount_enabled, the camera direction is derived
-        # from the (misaligned) mount + rotation around its RA axis.
+        # Equatorial mount state. When mount_enabled, the camera direction
+        # is derived from the (misaligned) mount + RA-axis rotation +
+        # mount-frame declination.
+        #
+        #   mount_alt_offset_arcmin, mount_az_offset_arcmin :
+        #       misalignment between the mount pole and the true celestial
+        #       pole (the thing PA is trying to drive to zero).
+        #
+        #   mount_ra_axis_deg :
+        #       rotation around the mount's polar axis ("turning the RA
+        #       drive"). Sweeps the camera along a small circle around the
+        #       mount pole.
+        #
+        #   mount_dec_deg :
+        #       camera declination in the *mount* frame. +90 = pointing at
+        #       the mount pole, 0 = mount-celestial-equator, -90 = opposite
+        #       pole. Equivalent to "tipping the DEC axis".
         self.mount_enabled               = False
         self.mount_alt_offset_arcmin     = 30.0
         self.mount_az_offset_arcmin      = 0.0
         self.mount_ra_axis_deg           = 0.0
-        self.target_offset_deg           = 8.0
+        self.mount_dec_deg               = 82.0   # 8° from mount pole
 
         # Temp dir for the watched frame + tracker working area.
         self._tmp = Path(tempfile.mkdtemp(prefix="tetra3_sim_"))
@@ -223,8 +238,11 @@ class Sim:
             e2 = np.cross(pole, e1)
             perp = np.cos(az_dir) * e1 + np.sin(az_dir) * e2
             mount_pole_v = pole * np.cos(offset_rad) + perp * np.sin(offset_rad)
-        init = (mount_pole_v * np.cos(np.radians(self.target_offset_deg))
-              + perp_unit(mount_pole_v) * np.sin(np.radians(self.target_offset_deg)))
+        # Place the camera at angular distance (90° − mount_dec_deg) from
+        # the mount pole, then sweep around the polar axis.
+        offset_from_pole_rad = np.radians(90.0 - self.mount_dec_deg)
+        init = (mount_pole_v * np.cos(offset_from_pole_rad)
+              + perp_unit(mount_pole_v) * np.sin(offset_from_pole_rad))
         cam_v = rotate_axis(init, mount_pole_v,
                             np.radians(self.mount_ra_axis_deg))
         ra_rad, dec_rad = radec(cam_v)
@@ -277,7 +295,7 @@ class Sim:
                 "alt_offset_arcmin": self.mount_alt_offset_arcmin,
                 "az_offset_arcmin":  self.mount_az_offset_arcmin,
                 "ra_axis_deg":       self.mount_ra_axis_deg,
-                "target_offset_deg": self.target_offset_deg,
+                "dec_deg":           self.mount_dec_deg,
             },
             "daemon": {
                 "mode":    s.get("mode", "?"),
@@ -371,6 +389,17 @@ class Sim:
             self.mount_ra_axis_deg = (self.mount_ra_axis_deg
                                      + float(cmd.get("ddeg", 0))) % 360.0
             await self.regenerate_image()
+        elif kind == "mount_dec":
+            # Absolute set; clamped to [-89, +90] so we stay on the sphere.
+            self.mount_dec_deg = float(np.clip(cmd.get("deg",
+                                                       self.mount_dec_deg),
+                                                -89.0, 90.0))
+            await self.regenerate_image()
+        elif kind == "mount_dec_delta":
+            self.mount_dec_deg = float(np.clip(
+                self.mount_dec_deg + float(cmd.get("ddeg", 0)),
+                -89.0, 90.0))
+            await self.regenerate_image()
         elif kind == "mount_set":
             if "alt_offset_arcmin" in cmd:
                 self.mount_alt_offset_arcmin = float(cmd["alt_offset_arcmin"])
@@ -378,8 +407,8 @@ class Sim:
                 self.mount_az_offset_arcmin = float(cmd["az_offset_arcmin"])
             if "ra_axis_deg" in cmd:
                 self.mount_ra_axis_deg = float(cmd["ra_axis_deg"]) % 360.0
-            if "target_offset_deg" in cmd:
-                self.target_offset_deg = float(cmd["target_offset_deg"])
+            if "dec_deg" in cmd:
+                self.mount_dec_deg = float(np.clip(cmd["dec_deg"], -89.0, 90.0))
             await self.regenerate_image()
         elif kind == "button":
             which = cmd.get("which")
@@ -544,10 +573,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
               <button onclick="cmd({cmd:'mount_rotate', ddeg:-5})">⟲ 5°</button>
               <button onclick="cmd({cmd:'mount_rotate', ddeg:+5})">5° ⟳</button>
               <button onclick="cmd({cmd:'mount_rotate', ddeg:+15})">15° ⟳</button></td></tr>
+      <tr><td>Dec (mount)</td>
+          <td><input id=mount_dec type=number step=1 min=-89 max=90 style="width:5em"></td>
+          <td><button onclick="cmd({cmd:'mount_dec_delta', ddeg:-20})">−20°</button>
+              <button onclick="cmd({cmd:'mount_dec_delta', ddeg:-5})">−5°</button>
+              <button onclick="cmd({cmd:'mount_dec_delta', ddeg:-1})">−1°</button>
+              <button onclick="cmd({cmd:'mount_dec_delta', ddeg:+1})">+1°</button>
+              <button onclick="cmd({cmd:'mount_dec_delta', ddeg:+5})">+5°</button>
+              <button onclick="cmd({cmd:'mount_dec_delta', ddeg:+20})">+20°</button>
+              <span class=keys>(+90 = at mount pole, 0 = mount equator)</span></td></tr>
       <tr><td colspan=3 class=keys>
-        Mount mode locks RA/Dec; the camera follows a virtual mount pivoting
-        around its (mis)aligned RA axis. Drive the offset down with the
-        alt/az "knobs" and watch the PA fix chart converge.
+        Mount mode emulates an equatorial mount whose polar axis is offset
+        from the true celestial pole by (alt_off, az_off). RA axis rotates
+        the camera around that pole; Dec slides it along the meridian.
+        Drive the offset down with the alt/az knobs and watch the PA fix
+        chart converge.
       </td></tr>
     </table>
   </div>
@@ -569,6 +609,9 @@ const mounten = document.getElementById('mounten');
 const alt_off = document.getElementById('alt_off');
 const az_off = document.getElementById('az_off');
 const ra_axis = document.getElementById('ra_axis');
+const mount_dec = document.getElementById('mount_dec');
+mount_dec.addEventListener('change',
+  () => cmd({cmd:'mount_dec', deg:+mount_dec.value}));
 
 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const ws = new WebSocket(proto + '//' + location.host + '/ws');
@@ -610,6 +653,13 @@ document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;
   let dra = 0, ddec = 0;
   const step = e.shiftKey ? 5 : (e.ctrlKey ? 0.1 : 1);
+  // In mount mode, repurpose the arrow keys: ←/→ = RA axis, ↑/↓ = mount Dec.
+  if (mounten.checked) {
+    if (e.key === 'ArrowLeft')  { cmd({cmd:'mount_rotate', ddeg:-step}); e.preventDefault(); return; }
+    if (e.key === 'ArrowRight') { cmd({cmd:'mount_rotate', ddeg:+step}); e.preventDefault(); return; }
+    if (e.key === 'ArrowUp')    { cmd({cmd:'mount_dec_delta', ddeg:+step}); e.preventDefault(); return; }
+    if (e.key === 'ArrowDown')  { cmd({cmd:'mount_dec_delta', ddeg:-step}); e.preventDefault(); return; }
+  }
   if      (e.key === 'ArrowLeft')  dra = -step;
   else if (e.key === 'ArrowRight') dra = +step;
   else if (e.key === 'ArrowDown')  ddec = -step;
@@ -678,6 +728,8 @@ function render(s) {
   alt_off.textContent = fmt(s.mount.alt_offset_arcmin, 1);
   az_off.textContent  = fmt(s.mount.az_offset_arcmin, 1);
   ra_axis.textContent = fmt(s.mount.ra_axis_deg, 1);
+  if (document.activeElement !== mount_dec)
+    mount_dec.value = fmt(s.mount.dec_deg, 1);
 
   const rows = [];
   rows.push(['Mode',   s.daemon.mode]);
