@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from devtool import load_hipparcos_cached, generate_star_field
+from imaging import load_hipparcos_cached, generate_star_field
 
 # Test coordinates: (ra_deg, dec_deg, label)
 TEST_FIELDS = [

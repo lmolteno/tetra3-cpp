@@ -13,3 +13,4 @@ build/
 __pycache__/
 tools/star_catalog/.cache/
 tools/star_catalog/.venv/
+tools/star_catalog/coverage_results.json
