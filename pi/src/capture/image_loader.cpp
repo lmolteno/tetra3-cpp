@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <sys/stat.h>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -16,8 +17,21 @@
 #define STBI_NO_LINEAR
 #include <stb_image.h>
 
-ImageFileSource::ImageFileSource(const std::string &path, bool verbose)
-    : file_path(path), verbose(verbose) {}
+ImageFileSource::ImageFileSource(const std::string &path, bool verbose,
+                                  bool watch)
+    : file_path(path), verbose(verbose), watch_(watch) {}
+
+static int64_t file_mtime_ns(const std::string &path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return 0;
+#if defined(__APPLE__)
+    return static_cast<int64_t>(st.st_mtimespec.tv_sec) * 1000000000LL
+         + st.st_mtimespec.tv_nsec;
+#else
+    return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL
+         + st.st_mtim.tv_nsec;
+#endif
+}
 
 namespace {
 
@@ -103,7 +117,7 @@ bool load_pgm_16(const std::string &path, std::vector<uint16_t> &out,
 
 }
 
-bool ImageFileSource::initialize() {
+bool ImageFileSource::do_load() {
     // Try our PGM-16 fast path first (covers the common synthetic / raw-dump
     // case).
     int w = 0, h = 0, bit_depth = 0;
@@ -160,7 +174,39 @@ bool ImageFileSource::initialize() {
     return true;
 }
 
+bool ImageFileSource::initialize() {
+    if (!do_load()) return false;
+    last_mtime_ns_ = file_mtime_ns(file_path);
+    delivered_ = false;
+    return true;
+}
+
 std::optional<Frame> ImageFileSource::capture() {
     if (!loaded) return std::nullopt;
+
+    if (!watch_) {
+        // Original behaviour: always return the loaded frame.
+        return frame;
+    }
+
+    // Watch mode: deliver the loaded frame once, then only re-deliver when
+    // the file's mtime advances (the simulator/test writes a new image).
+    if (!delivered_) {
+        delivered_ = true;
+        return frame;
+    }
+
+    int64_t mt = file_mtime_ns(file_path);
+    if (mt == 0 || mt == last_mtime_ns_) {
+        // No update yet. Return nullopt so the daemon's "no fresh frame"
+        // path runs — render the last solve, don't resubmit.
+        return std::nullopt;
+    }
+
+    if (!do_load()) {
+        // Partial write or transient error — try again next tick.
+        return std::nullopt;
+    }
+    last_mtime_ns_ = mt;
     return frame;
 }

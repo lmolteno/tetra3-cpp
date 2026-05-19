@@ -39,6 +39,7 @@
 
 struct AppConfig {
     std::string image_path;
+    bool        image_watch = false;
     int cam_width  = 2028;
     int cam_height = 1520;
     float lat = OBSERVER_LAT_DEG;
@@ -87,6 +88,7 @@ static AppConfig parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if      (arg == "--image"      && i + 1 < argc) cfg.image_path  = argv[++i];
+        else if (arg == "--image-watch")                cfg.image_watch = true;
         else if (arg == "--width"      && i + 1 < argc) cfg.cam_width   = std::stoi(argv[++i]);
         else if (arg == "--height"     && i + 1 < argc) cfg.cam_height  = std::stoi(argv[++i]);
         else if (arg == "--lat"        && i + 1 < argc) cfg.lat         = std::stof(argv[++i]);
@@ -128,6 +130,9 @@ static AppConfig parse_args(int argc, char *argv[]) {
             std::cerr <<
                 "Usage: pi_tracker [options]\n"
                 "  --image <path>            Use a test image instead of libcamera\n"
+                "  --image-watch             With --image, reload on mtime change so\n"
+                "                            an external tool (eg the PA simulator) can\n"
+                "                            feed fresh frames by overwriting the file\n"
                 "  --width/--height <n>      Camera capture dims (default 2028x1520)\n"
                 "  --lat/--lon <deg>         Observer location (default compile-time)\n"
                 "  --frames-dir <path>       Rolling frame archive (default /dev/shm/pi_tracker/frames)\n"
@@ -169,7 +174,9 @@ static AppConfig parse_args(int argc, char *argv[]) {
 static std::unique_ptr<IFrameSource> make_source(const AppConfig &cfg,
                                                   const cam_state::Settings &s) {
     if (!cfg.image_path.empty()) {
-        return std::make_unique<ImageFileSource>(cfg.image_path);
+        return std::make_unique<ImageFileSource>(cfg.image_path,
+                                                 /*verbose=*/false,
+                                                 cfg.image_watch);
     }
 #ifdef HAS_LIBCAMERA
     auto cam = std::make_unique<LibcameraCapture>(cfg.cam_width, cfg.cam_height);
@@ -381,6 +388,31 @@ int main(int argc, char *argv[]) {
                 cs.gain = *cmd.gain;
                 cam_state::save_gain(cfg.state_dir, cs.gain);
                 apply_to_camera([&](auto *cam) { cam->set_gain(cs.gain); });
+            }
+            if (cmd.solve) {
+                // Inject a fake solve as if solve_cli had just returned it.
+                // Used by the PA simulator / accuracy test tools when running
+                // pi_tracker under --no-solver so PA logic can be exercised
+                // with deterministic, noise-controllable solve outputs.
+                last_result.solved        = cmd.solve->solved;
+                last_result.ra            = cmd.solve->ra_rad;
+                last_result.dec           = cmd.solve->dec_rad;
+                last_result.roll          = cmd.solve->roll_rad;
+                last_result.fov           = cmd.solve->fov_rad;
+                last_result.rmse          = cmd.solve->rmse;
+                last_result.num_matches   = cmd.solve->num_matches;
+                last_result.solve_time_ms = 0;
+                last_result.distortion_k  = 0;
+                last_result_at            = std::chrono::steady_clock::now();
+                if (last_result.solved &&
+                    mode == AppMode::PASampling) {
+                    aligner.add_sample(last_result.ra, last_result.dec,
+                                       now_steady());
+                }
+                if (last_result.solved && imu_tracker) {
+                    imu_tracker->update_solve(last_result.ra, last_result.dec,
+                                              last_result.roll);
+                }
             }
         }
 

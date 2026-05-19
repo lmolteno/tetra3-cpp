@@ -95,6 +95,27 @@ std::optional<ControlInput::Command> ControlInput::parse_line(const std::string 
         if (*v >= 0) cmd.exposure_us = static_cast<uint32_t>(*v);
     }
 
-    if (!cmd.mode && !cmd.lens_pos && !cmd.exposure_us && !cmd.gain) return std::nullopt;
+    // Look for a "solve" key. We only inject a solve if at least one of the
+    // numeric fields is present — otherwise the inner search just sees the
+    // outer "mode" key and produces a bogus inject.
+    if (line.find("\"solve\"") != std::string::npos) {
+        InjectedSolve s;
+        bool any = false;
+        if (auto v = find_float(line, "ra_rad"))   { s.ra_rad   = *v; any = true; }
+        if (auto v = find_float(line, "dec_rad"))  { s.dec_rad  = *v; any = true; }
+        if (auto v = find_float(line, "roll_rad")) { s.roll_rad = *v; any = true; }
+        if (auto v = find_float(line, "fov_rad"))  { s.fov_rad  = *v; any = true; }
+        if (auto v = find_float(line, "rmse"))     { s.rmse     = *v; }
+        if (auto v = find_float(line, "matches"))  { s.num_matches = static_cast<int>(*v); }
+        // "solved":false explicitly injects a no-solve frame.
+        if (line.find("\"solved\":false") != std::string::npos) {
+            s.solved = false;
+            any = true;
+        }
+        if (any) cmd.solve = s;
+    }
+
+    if (!cmd.mode && !cmd.lens_pos && !cmd.exposure_us
+        && !cmd.gain && !cmd.solve) return std::nullopt;
     return cmd;
 }

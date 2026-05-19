@@ -15,14 +15,30 @@
 //   {"lens_pos":    <float>}     diopters
 //   {"exposure_us": <int>}       microseconds
 //   {"gain":        <float>}     analogue-gain multiplier
+//   {"solve": {                  inject a fake solve result — used by the
+//      "ra_rad":  <float>,        PA simulator / accuracy test tools to drive
+//      "dec_rad": <float>,        the daemon without running solve_cli. Pair
+//      "roll_rad":<float>,        with --no-solver. ra/dec/roll/fov required;
+//      "fov_rad": <float>,        rmse and matches default to 0/4. Set
+//      "rmse":    <float>,        "solved":false to inject a no-solve frame.
+//      "matches": <int>,
+//      "solved":  <bool>}}
 // Multiple keys per line are allowed and treated as a single command.
 class ControlInput {
 public:
+    struct InjectedSolve {
+        bool   solved = true;
+        float  ra_rad = 0, dec_rad = 0, roll_rad = 0, fov_rad = 0;
+        float  rmse   = 0;
+        int    num_matches = 0;
+    };
+
     struct Command {
-        std::optional<AppMode>  mode;
-        std::optional<float>    lens_pos;
-        std::optional<uint32_t> exposure_us;
-        std::optional<float>    gain;
+        std::optional<AppMode>       mode;
+        std::optional<float>         lens_pos;
+        std::optional<uint32_t>      exposure_us;
+        std::optional<float>         gain;
+        std::optional<InjectedSolve> solve;
     };
 
     ControlInput();
