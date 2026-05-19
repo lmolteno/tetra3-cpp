@@ -546,8 +546,21 @@ int main(int argc, char *argv[]) {
         fill_state(s);
         s.result = last_result;
         s.pa_samples = aligner.num_samples();
-        s.pole = aligner.estimate_pole();
-        s.offset = aligner.pole_error(s.pole);
+        // In PAFix we want the live (sidereal-drift-corrected) pole, not the
+        // frozen fit — the frozen fit's pole is expressed in the t0 (first-
+        // sample) frame, but pole_error projects through LST_now, so the
+        // reported alt/az drifts at the sidereal rate over time. The live
+        // tracker advances the cached pole at sidereal rate so its
+        // pole_error projection stays anchored to physical reality. The
+        // OLED chart already uses pa_live_offset; this brings the JSON
+        // output (which simulators and the web viewer read) in line.
+        if (mode == AppMode::PAFix && pa_live_pole.valid) {
+            s.pole   = pa_live_pole;
+            s.offset = pa_live_offset;
+        } else {
+            s.pole   = aligner.estimate_pole();
+            s.offset = aligner.pole_error(s.pole);
+        }
         // Always point at the most recently archived frame so the web UI can
         // render even on stale ticks.
         s.frame_path = frame_path.empty() ? last_archived_path : frame_path;

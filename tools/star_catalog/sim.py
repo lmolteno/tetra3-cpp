@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,48 @@ def perp_unit(v):
     else:
         e = np.cross(v, np.array([1.0, 0.0, 0.0]))
     return e / np.linalg.norm(e)
+
+
+def altaz_to_xyz(alt_rad, az_rad):
+    """Horizon-frame unit vector: X=east, Y=north, Z=zenith.
+
+    Azimuth is measured CW from north (0 = N, 90 = E, 180 = S, 270 = W),
+    matching the convention used by polar_align.cpp's eq_to_altaz.
+    """
+    ca = np.cos(alt_rad); sa = np.sin(alt_rad)
+    return np.array([ca * np.sin(az_rad), ca * np.cos(az_rad), sa])
+
+
+def xyz_to_altaz(v):
+    alt = float(np.arcsin(np.clip(v[2], -1.0, 1.0)))
+    az  = float(np.arctan2(v[0], v[1]) % (2 * np.pi))
+    return alt, az
+
+
+def altaz_to_radec(alt_rad, az_rad, lat_rad, lst_rad):
+    """Inverse of polar_align.cpp's eq_to_altaz, using the same conventions."""
+    sin_lat, cos_lat = np.sin(lat_rad), np.cos(lat_rad)
+    sin_alt, cos_alt = np.sin(alt_rad),  np.cos(alt_rad)
+    cos_az,  sin_az  = np.cos(az_rad),   np.sin(az_rad)
+    sin_dec = sin_lat * sin_alt + cos_lat * cos_alt * cos_az
+    dec = float(np.arcsin(np.clip(sin_dec, -1.0, 1.0)))
+    # Hour angle, then RA = LST - HA.
+    ha = np.arctan2(-sin_az * cos_alt,
+                    cos_lat * sin_alt - sin_lat * cos_alt * cos_az)
+    ra = float((lst_rad - ha) % (2 * np.pi))
+    return ra, dec
+
+
+def lst_rad(unix_time, lon_rad):
+    """Local sidereal time in radians — matches polar_align.cpp::lst_rad."""
+    jd = unix_time / 86400.0 + 2440587.5
+    T = (jd - 2451545.0) / 36525.0
+    gmst_deg = (280.46061837
+                + 360.98564736629 * (jd - 2451545.0)
+                + 0.000387933 * T * T) % 360.0
+    if gmst_deg < 0:
+        gmst_deg += 360.0
+    return np.radians(gmst_deg) + lon_rad
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +195,8 @@ class Sim:
     def __init__(self, args, stars):
         self.args = args
         self.stars = stars
+        self.obs_lat_rad = np.radians(args.latitude)
+        self.obs_lon_rad = np.radians(args.longitude)
 
         # Camera state.
         self.cam_ra_deg    = 0.0
@@ -220,33 +265,51 @@ class Sim:
     # ---- camera direction ----
 
     def cam_radec_now(self):
-        """Return the synthesizer's camera (RA, Dec) in degrees."""
+        """Camera (RA, Dec) in degrees.
+
+        In mount mode the camera direction is built in the *horizon* frame
+        and then projected to (RA, Dec) at the current LST so the
+        simulator and the polar-align daemon are talking about the same
+        alt/az axes. The mount pole sits at the observer's true celestial
+        pole (alt = |lat|, az = 180 in the south, az = 0 in the north),
+        offset by the user's alt/az knobs; rotating around the polar axis
+        sweeps the camera around the mount pole at fixed mount Dec.
+        Because the camera is anchored in alt/az while the celestial frame
+        spins underneath it, the returned (RA, Dec) drifts at the sidereal
+        rate over real time — matching how a stationary real mount looks
+        to a real solver.
+        """
         if not self.mount_enabled:
             return self.cam_ra_deg, self.cam_dec_deg
-        # Derive from mount.
-        true_pole_dec = np.pi / 2 if self.args.latitude >= 0 else -np.pi / 2
-        offset_total = np.hypot(self.mount_alt_offset_arcmin,
-                                self.mount_az_offset_arcmin)
-        offset_rad = np.radians(offset_total / 60.0)
-        if offset_total < 1e-6:
-            mount_pole_v = unit(0.0, true_pole_dec)
-        else:
-            az_dir = np.arctan2(self.mount_az_offset_arcmin,
-                                self.mount_alt_offset_arcmin)
-            pole = unit(0.0, true_pole_dec)
-            e1 = perp_unit(pole)
-            e2 = np.cross(pole, e1)
-            perp = np.cos(az_dir) * e1 + np.sin(az_dir) * e2
-            mount_pole_v = pole * np.cos(offset_rad) + perp * np.sin(offset_rad)
-        # Place the camera at angular distance (90° − mount_dec_deg) from
-        # the mount pole, then sweep around the polar axis.
-        offset_from_pole_rad = np.radians(90.0 - self.mount_dec_deg)
-        init = (mount_pole_v * np.cos(offset_from_pole_rad)
-              + perp_unit(mount_pole_v) * np.sin(offset_from_pole_rad))
-        cam_v = rotate_axis(init, mount_pole_v,
-                            np.radians(self.mount_ra_axis_deg))
-        ra_rad, dec_rad = radec(cam_v)
-        return float(np.degrees(ra_rad)), float(np.degrees(dec_rad))
+
+        lat = self.obs_lat_rad
+        lst = lst_rad(time.time(), self.obs_lon_rad)
+
+        # True celestial pole in horizon frame.
+        true_pole_az_rad = 0.0 if lat >= 0 else np.pi
+        true_pole_alt_rad = abs(lat)
+
+        # Mount pole offset by the alt/az knobs. Sign convention:
+        #   alt_offset_arcmin > 0 -> mount pole higher than true pole
+        #   az_offset_arcmin  > 0 -> mount pole east  of true pole's azimuth
+        mount_alt = true_pole_alt_rad + np.radians(self.mount_alt_offset_arcmin / 60.0)
+        mount_az  = true_pole_az_rad  + np.radians(self.mount_az_offset_arcmin  / 60.0)
+        mount_pole_v = altaz_to_xyz(mount_alt, mount_az)
+
+        # Camera in horizon frame: at angle (90° − mount_dec) from the
+        # mount pole, swept around it by mount_ra_axis_deg. The "zero
+        # rotation" reference direction is perp to the mount pole — its
+        # exact orientation only changes which sky region the camera lands
+        # on at RA-axis = 0; the rotation IS the mount's RA drive.
+        offset_from_pole = np.radians(90.0 - self.mount_dec_deg)
+        init = (mount_pole_v * np.cos(offset_from_pole)
+              + perp_unit(mount_pole_v) * np.sin(offset_from_pole))
+        cam_v_horizon = rotate_axis(init, mount_pole_v,
+                                    np.radians(self.mount_ra_axis_deg))
+
+        cam_alt, cam_az = xyz_to_altaz(cam_v_horizon)
+        ra, dec = altaz_to_radec(cam_alt, cam_az, lat, lst)
+        return float(np.degrees(ra)), float(np.degrees(dec))
 
     # ---- image regeneration ----
 
@@ -319,6 +382,16 @@ class Sim:
         }
 
     # ---- tracker reader ----
+
+    async def sidereal_refresh_task(self):
+        """Re-render the synth periodically while in mount mode so the
+        camera's celestial coords keep up with sidereal drift. Without
+        this the daemon's de-rotation would introduce a fake "samples
+        drifting in RA" signal between user actions."""
+        while True:
+            await asyncio.sleep(0.5)
+            if self.mount_enabled:
+                await self.regenerate_image()
 
     async def tracker_reader(self):
         loop = asyncio.get_event_loop()
@@ -804,6 +877,7 @@ async def init_app(args):
     await sim.regenerate_image()
     sim.start_tracker()
     asyncio.create_task(sim.tracker_reader())
+    asyncio.create_task(sim.sidereal_refresh_task())
 
     app = web.Application()
     app["sim"] = sim
@@ -831,7 +905,10 @@ def main():
     p.add_argument("--gain", type=float, default=16.0,
                    help="Synthetic camera analogue gain. Matches "
                         "--gain 16 in pi_tracker.")
-    p.add_argument("--latitude", type=float, default=-33.86)
+    p.add_argument("--latitude",  type=float, default=-33.86,
+                   help="Observer latitude (degrees, negative = south)")
+    p.add_argument("--longitude", type=float, default=151.21,
+                   help="Observer longitude (degrees, positive = east)")
     p.add_argument("--star-source", choices=("hipparcos", "binary"),
                    default="hipparcos")
     p.add_argument("--host", default="127.0.0.1")
