@@ -126,6 +126,35 @@ def _get_star_arrays(stars_dict):
     return _star_arrays_cache[key]
 
 
+# ---------------------------------------------------------------------------
+# Pi Camera Module 3 NoIR (IMX708) calibration constants
+#
+# Empirical / approximate fit so synthetic images "look like" what the daemon
+# sees with `--gain 16 --exposure-us 100000`. Numbers tuned so:
+#
+#   - V≈0 stars saturate (e.g. Sirius, Vega).
+#   - V≈5 stars have peak ~1500 ADU above a ~1000 ADU light-polluted sky.
+#   - V≈7 stars peak ~200 ADU above bg, near the detection floor.
+#   - PSF is sharp (sigma ≈ 1 px) — Pi Cam at infinity focus.
+#
+# Cool stars (M/K class) read brighter on a NoIR sensor than V-mag suggests
+# because the IR cut filter is missing — that effect is not modelled here
+# (catalog has no B−V data), so this is an idealised V-band response.
+PI_CAM_BASE = dict(
+    bg_at_gain1_per_sec     = 400.0,   # ADU/s/pixel of light-polluted sky
+    read_noise_at_gain1     = 2.0,     # ADU stddev at unity gain
+    electrons_per_adu_at_g1 = 8.0,     # rough sensor gain at unity (e/ADU)
+    flux_v0_at_gain1_per_s  = 240000.0,  # total ADU/s from a V=0 star
+    psf_sigma_px            = 1.0,     # at infinity focus
+)
+# At gain=16, exposure=0.1s, those numbers give:
+#   - sky bg            ≈ 640 ADU
+#   - read noise stddev ≈ 32 ADU
+#   - V=0 total flux    ≈ 384000 ADU → peak ≈ 61000 ADU (just saturating)
+#   - V=5 total flux    ≈ 3840 ADU   → peak ≈ 611 ADU above bg
+#   - V=7 total flux    ≈ 605 ADU    → peak ≈ 96 ADU above bg (~3σ vs noise)
+
+
 def generate_star_field(
     stars_dict,
     center_ra_deg,
@@ -134,16 +163,28 @@ def generate_star_field(
     roll_deg=0.0,
     width=2028,
     height=1520,
-    noise_level=8,
+    *,
+    # New Pi-Cam-like model (default). Pass exposure_ms / gain instead of
+    # bg_level / noise_level / flux_scale.
+    exposure_ms=100.0,
+    gain=16.0,
+    saturation_adu=65535,
+    # Legacy knobs. If `noise_level` is given, fall back to the old simple
+    # Gaussian-noise model so existing tests keep working unchanged.
+    noise_level=None,
     bg_level=50,
-    psf_sigma=2.0,
-    flux_scale=200000.0,
+    psf_sigma=None,
+    flux_scale=None,
 ):
     """Generate a 16-bit synthetic star field image.
 
-    Uses gnomonic projection, Gaussian PSFs, and Gaussian read noise.
-    roll_deg rotates the camera around the optical axis (degrees).
-    Returns a uint16 numpy array of shape (height, width).
+    Default behaviour models the Pi Cam Module 3 NoIR at 100 ms / gain 16:
+    flux scales as 10^(-0.4·mag), per-pixel shot noise + read noise
+    contribute realistic variance, and bright stars saturate. The PNG
+    preview the simulator emits will then show a wide range of brightnesses.
+
+    Pass `noise_level` to use the legacy Gaussian-noise model (used by
+    the existing accuracy/coverage tests).
     """
     center_ra = np.radians(center_ra_deg)
     center_dec = np.radians(center_dec_deg)
@@ -189,15 +230,37 @@ def generate_star_field(
     py = py[sel]
     mags = all_mag[idx[sel]]
 
-    flux = np.power(10, -0.4 * mags) * flux_scale
+    # Two calibration paths.
+    use_legacy = noise_level is not None
+    if use_legacy:
+        # Old behaviour — used by accuracy_test.py and coverage_test.py.
+        sigma = float(psf_sigma if psf_sigma is not None else 2.0)
+        bg = float(bg_level)
+        fs = float(flux_scale if flux_scale is not None else 200000.0)
+        flux = np.power(10, -0.4 * mags) * fs
+        noise_sd = float(noise_level)
+        use_shot = False
+    else:
+        # Pi Cam Module 3 NoIR model.
+        cal = PI_CAM_BASE
+        exp_s = float(exposure_ms) / 1000.0
+        bg = cal["bg_at_gain1_per_sec"] * exp_s * gain
+        # Total ADU per V=0 star, scaled by exposure and gain.
+        fs = cal["flux_v0_at_gain1_per_s"] * exp_s * gain
+        flux = np.power(10, -0.4 * mags) * fs
+        sigma = float(psf_sigma if psf_sigma is not None else cal["psf_sigma_px"])
+        # Read noise scales linearly with gain in this idealised model.
+        read_noise_sd = cal["read_noise_at_gain1"] * gain
+        # Electrons-per-ADU scales inversely with gain.
+        electrons_per_adu = cal["electrons_per_adu_at_g1"] / gain
+        noise_sd = None
+        use_shot = True
 
-    # Stamp each star with a Gaussian PSF
-    sigma = float(psf_sigma)
     r = int(4 * sigma)
-    norm = 1.0 / (2 * np.pi * sigma**2)
+    norm = 1.0 / (2 * np.pi * sigma ** 2)
     two_sigma2 = 2.0 * sigma * sigma
 
-    img = np.full((height, width), bg_level, dtype=np.float32)
+    img = np.full((height, width), bg, dtype=np.float32)
 
     for i in range(len(px)):
         sx, sy, sf = px[i], py[i], flux[i]
@@ -214,10 +277,20 @@ def generate_star_field(
         gy = np.exp(-ys * ys / two_sigma2)
         img[y0:y1, x0:x1] += (sf * norm) * np.outer(gy, gx)
 
-    if noise_level > 0:
-        img += np.random.normal(0, noise_level, img.shape).astype(np.float32)
+    if use_legacy:
+        if noise_sd > 0:
+            img += np.random.normal(0, noise_sd, img.shape).astype(np.float32)
+    else:
+        # Shot noise: Poisson on electrons, scaled back to ADU. Approximate
+        # with a Gaussian whose sd is sqrt(signal × electrons_per_ADU) / gain
+        # — same variance as the Poisson at the electron count, expressed
+        # back in ADU. Add read noise in quadrature.
+        signal_clip = np.maximum(img, 0.0)
+        var_adu = signal_clip / electrons_per_adu + read_noise_sd ** 2
+        sd_adu = np.sqrt(var_adu, dtype=np.float32)
+        img += np.random.normal(0.0, 1.0, img.shape).astype(np.float32) * sd_adu
 
-    np.clip(img, 0, 65535, out=img)
+    np.clip(img, 0, float(saturation_adu), out=img)
     return img.astype(np.uint16)
 
 

@@ -85,12 +85,20 @@ def img_to_png(img_u16, max_dim=512):
             new_h, sy, new_w, sx).mean(axis=(1, 3))
 
     arr = np.asarray(img_u16, dtype=np.float32)
-    # Contrast-stretch by percentile so stars pop without being saturated.
-    lo = float(np.percentile(arr, 10))
-    hi = float(np.percentile(arr, 99.9))
-    if hi <= lo:
-        hi = lo + 1.0
-    out = np.clip((arr - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    # Background-subtract by the median, then apply a sinh⁻¹ stretch so the
+    # huge dynamic range of a real photometric scene (bg ≈ 600 vs Sirius at
+    # 65535) is visible to the eye. arcsinh preserves zero, behaves linearly
+    # near the floor, and compresses bright stars — same trick astropy and
+    # SAOImage DS9 use for star fields.
+    bg = float(np.median(arr))
+    a = np.maximum(arr - bg, 0.0)
+    # Scale so the 99.95% percentile maps to arcsinh argument ~10
+    # (≈ 3.0 in output), then renormalise to 0..255.
+    p_hi = float(np.percentile(a, 99.95))
+    if p_hi < 1.0:
+        p_hi = 1.0
+    stretched = np.arcsinh(a * (10.0 / p_hi)) / np.arcsinh(10.0)
+    out = np.clip(stretched * 255.0, 0, 255).astype(np.uint8)
     im = Image.fromarray(out, mode="L")
     buf = io.BytesIO()
     im.save(buf, format="PNG")
@@ -146,11 +154,12 @@ class Sim:
         self.stars = stars
 
         # Camera state.
-        self.cam_ra_deg   = 0.0
-        self.cam_dec_deg  = 0.0
-        self.cam_roll_deg = 0.0
-        self.cam_fov_deg  = args.fov
-        self.noise        = args.noise
+        self.cam_ra_deg    = 0.0
+        self.cam_dec_deg   = 0.0
+        self.cam_roll_deg  = 0.0
+        self.cam_fov_deg   = args.fov
+        self.exposure_ms   = args.exposure_ms
+        self.gain          = args.gain
 
         # Mount state. When mount_enabled, the camera direction is derived
         # from the (misaligned) mount + rotation around its RA axis.
@@ -179,13 +188,18 @@ class Sim:
         # Lock to serialise image regeneration.
         self._regen_lock = asyncio.Lock()
 
+        # Tracker subprocess started later (after first frame is on disk —
+        # pi_tracker --image fails if the file doesn't exist yet).
+        self.tracker = None
+
+    def start_tracker(self):
         self.tracker = Tracker(
-            tracker=args.tracker, solver=args.solver,
-            db_stars=args.db_stars, db_patterns=args.db_patterns,
+            tracker=self.args.tracker, solver=self.args.solver,
+            db_stars=self.args.db_stars, db_patterns=self.args.db_patterns,
             image_path=self.image_path,
             frames_dir=self._tmp / "frames",
             state_dir=self._tmp / "state",
-            width=args.width, height=args.height, fov=args.fov,
+            width=self.args.width, height=self.args.height, fov=self.args.fov,
         )
 
     # ---- camera direction ----
@@ -229,7 +243,7 @@ class Sim:
                     self.stars, ra_deg, dec_deg,
                     fov_deg=self.cam_fov_deg, roll_deg=self.cam_roll_deg,
                     width=self.args.width, height=self.args.height,
-                    noise_level=self.noise, psf_sigma=1.0, flux_scale=500000,
+                    exposure_ms=self.exposure_ms, gain=self.gain,
                 ))
             await loop.run_in_executor(
                 None, lambda: save_pgm_16(img, self.image_path))
@@ -256,7 +270,7 @@ class Sim:
             "cam": {
                 "ra_deg":  ra_deg, "dec_deg": dec_deg,
                 "fov_deg": self.cam_fov_deg, "roll_deg": self.cam_roll_deg,
-                "noise":   self.noise,
+                "exposure_ms": self.exposure_ms, "gain": self.gain,
             },
             "mount": {
                 "enabled":          self.mount_enabled,
@@ -291,22 +305,31 @@ class Sim:
     async def tracker_reader(self):
         loop = asyncio.get_event_loop()
         proc = self.tracker.proc
-        while True:
-            line = await loop.run_in_executor(None, proc.stdout.readline)
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                self.last_state = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            await self.broadcast({"type": "tick", "state": self.public_state()})
+        try:
+            while True:
+                line = await loop.run_in_executor(None, proc.stdout.readline)
+                if not line:
+                    print("sim: pi_tracker stdout closed — child exited",
+                          file=sys.stderr)
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self.last_state = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                await self.broadcast({"type": "tick", "state": self.public_state()})
+        except Exception as e:
+            print(f"sim: tracker_reader crashed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            raise
 
     # ---- commands from the browser ----
 
     async def handle_cmd(self, cmd: dict):
+        if self.tracker is None:
+            return
         kind = cmd.get("cmd")
         if kind == "pan":
             if self.mount_enabled:
@@ -330,8 +353,12 @@ class Sim:
             self.cam_fov_deg = float(np.clip(cmd.get("deg", self.cam_fov_deg),
                                               5.0, 120.0))
             await self.regenerate_image()
-        elif kind == "noise":
-            self.noise = int(cmd.get("value", self.noise))
+        elif kind == "exposure":
+            self.exposure_ms = float(np.clip(cmd.get("value", self.exposure_ms),
+                                              1.0, 5000.0))
+            await self.regenerate_image()
+        elif kind == "gain":
+            self.gain = float(np.clip(cmd.get("value", self.gain), 1.0, 128.0))
             await self.regenerate_image()
         elif kind == "mount_toggle":
             self.mount_enabled = bool(cmd.get("on", not self.mount_enabled))
@@ -476,13 +503,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <td><input id=fov type=number step=1></td>
           <td><button onclick="setFov(fov.value - 5)">−5°</button>
               <button onclick="setFov(fov.value + 5)">+5°</button></td></tr>
-      <tr><td>Noise</td>
-          <td colspan=2>
-            <select id=noise onchange="cmd({cmd:'noise', value:+this.value})">
-              <option>0</option><option>4</option>
-              <option selected>8</option><option>16</option><option>32</option>
-            </select>
-            <span class=keys>(σ; 0 fails — detector needs some BG noise)</span>
+      <tr><td>Exposure</td>
+          <td><input id=exposure type=number step=10 min=10 max=2000></td>
+          <td>ms
+              <button onclick="cmd({cmd:'exposure', value:+exposure.value/2})">÷2</button>
+              <button onclick="cmd({cmd:'exposure', value:+exposure.value*2})">×2</button>
+          </td></tr>
+      <tr><td>Gain</td>
+          <td><input id=gain type=number step=1 min=1 max=64></td>
+          <td><button onclick="cmd({cmd:'gain', value:+gain.value/2})">÷2</button>
+              <button onclick="cmd({cmd:'gain', value:+gain.value*2})">×2</button>
           </td></tr>
     </table>
     <div class=keys>Arrow keys pan, Shift = 5°, Ctrl = 0.1°</div>
@@ -533,7 +563,8 @@ const ra = document.getElementById('ra');
 const dec = document.getElementById('dec');
 const roll = document.getElementById('roll');
 const fov = document.getElementById('fov');
-const noise = document.getElementById('noise');
+const exposure = document.getElementById('exposure');
+const gain = document.getElementById('gain');
 const mounten = document.getElementById('mounten');
 const alt_off = document.getElementById('alt_off');
 const az_off = document.getElementById('az_off');
@@ -571,6 +602,8 @@ dec.addEventListener('change',
   () => cmd({cmd:'pan', ra:+ra.value, dec:+dec.value}));
 roll.addEventListener('change', () => setRoll(roll.value));
 fov.addEventListener('change',  () => setFov(fov.value));
+exposure.addEventListener('change', () => cmd({cmd:'exposure', value:+exposure.value}));
+gain.addEventListener('change', () => cmd({cmd:'gain', value:+gain.value}));
 
 // Keyboard shortcuts: arrows pan, space/backspace = buttons
 document.addEventListener('keydown', (e) => {
@@ -583,6 +616,10 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowUp')    ddec = +step;
   else if (e.key === ' ')   { cmd({cmd:'button', which:'forward'}); e.preventDefault(); return; }
   else if (e.key === 'Backspace') { cmd({cmd:'button', which:'back'}); e.preventDefault(); return; }
+  else if (e.key === 'e') { cmd({cmd:'exposure', value:+exposure.value*2}); return; }
+  else if (e.key === 'E') { cmd({cmd:'exposure', value:+exposure.value/2}); return; }
+  else if (e.key === 'g') { cmd({cmd:'gain', value:+gain.value*2}); return; }
+  else if (e.key === 'G') { cmd({cmd:'gain', value:+gain.value/2}); return; }
   else if (e.key === '[')   { setRoll(parseFloat(roll.value)-1); return; }
   else if (e.key === ']')   { setRoll(parseFloat(roll.value)+1); return; }
   else if (e.key === '+' || e.key === '=') { setFov(parseFloat(fov.value)-2); return; }
@@ -633,7 +670,10 @@ function render(s) {
   if (document.activeElement !== dec)  dec.value  = fmt(s.cam.dec_deg, 3);
   if (document.activeElement !== roll) roll.value = fmt(s.cam.roll_deg, 1);
   if (document.activeElement !== fov)  fov.value  = fmt(s.cam.fov_deg, 1);
-  noise.value = String(s.cam.noise);
+  if (document.activeElement !== exposure)
+    exposure.value = String(Math.round(s.cam.exposure_ms));
+  if (document.activeElement !== gain)
+    gain.value = String(Math.round(s.cam.gain));
   mounten.checked = s.mount.enabled;
   alt_off.textContent = fmt(s.mount.alt_offset_arcmin, 1);
   az_off.textContent  = fmt(s.mount.az_offset_arcmin, 1);
@@ -707,9 +747,10 @@ async def init_app(args):
     else:
         stars = load_hipparcos_cached()
     sim = Sim(args, stars)
-    # Initial image.
+    # Initial image must exist before pi_tracker starts — its image source
+    # opens the file in initialize() and exits if it's missing.
     await sim.regenerate_image()
-    # Kick off the tracker reader.
+    sim.start_tracker()
     asyncio.create_task(sim.tracker_reader())
 
     app = web.Application()
@@ -732,7 +773,12 @@ def main():
     p.add_argument("--width",  type=int, default=2028)
     p.add_argument("--height", type=int, default=1520)
     p.add_argument("--fov",    type=float, default=72.0)
-    p.add_argument("--noise",  type=int,   default=8)
+    p.add_argument("--exposure-ms", type=float, default=100.0,
+                   help="Synthetic camera exposure (ms). Matches "
+                        "--exposure-us 100000 in pi_tracker.")
+    p.add_argument("--gain", type=float, default=16.0,
+                   help="Synthetic camera analogue gain. Matches "
+                        "--gain 16 in pi_tracker.")
     p.add_argument("--latitude", type=float, default=-33.86)
     p.add_argument("--star-source", choices=("hipparcos", "binary"),
                    default="hipparcos")
@@ -755,7 +801,8 @@ def main():
             pass
         finally:
             await runner.cleanup()
-            app["sim"].tracker.close()
+            if app["sim"].tracker is not None:
+                app["sim"].tracker.close()
 
     asyncio.run(runner())
 
