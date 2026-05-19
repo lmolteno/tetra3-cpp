@@ -40,8 +40,20 @@ else()
     message(STATUS "libcamera not found - camera capture disabled (use --image)")
 endif()
 
+# stb_image.h location varies: Alpine puts it at /usr/include/stb_image.h, but
+# Debian/Ubuntu's libstb-dev tucks it under /usr/include/stb/. Find whichever
+# the system has and add its parent to the include path so the `#include
+# <stb_image.h>` form works either way.
+find_path(STB_IMAGE_INCLUDE_DIR
+    NAMES stb_image.h
+    PATH_SUFFIXES stb)
+if(NOT STB_IMAGE_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "stb_image.h not found. Install libstb-dev (Debian) or stb (Alpine).")
+endif()
+
 add_executable(pi_tracker ${PI_SOURCES})
-target_include_directories(pi_tracker PRIVATE src)
+target_include_directories(pi_tracker PRIVATE src ${STB_IMAGE_INCLUDE_DIR})
 target_link_libraries(pi_tracker PRIVATE tetra3_solver)
 
 # Pi 2 (Cortex-A7) and up have NEON. Alpine's armhf default is vfpv3-d16 with
@@ -89,7 +101,7 @@ add_executable(solve_cli
     src/capture/image_loader.cpp
     src/solver/star_detector.cpp
 )
-target_include_directories(solve_cli PRIVATE src)
+target_include_directories(solve_cli PRIVATE src ${STB_IMAGE_INCLUDE_DIR})
 target_link_libraries(solve_cli PRIVATE tetra3_solver)
 target_link_options(solve_cli PRIVATE -static)
 if(PI_NEON_ARMHF)
