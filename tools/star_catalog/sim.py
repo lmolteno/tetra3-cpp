@@ -267,65 +267,86 @@ class Sim:
 
     # ---- camera direction ----
 
-    def cam_radec_now(self):
-        """Camera (RA, Dec) in degrees.
+    def cam_radec_roll_now(self):
+        """Camera (RA, Dec, Roll) in degrees.
 
-        In mount mode the camera direction is built in the *horizon* frame
-        and then projected to (RA, Dec) at the current LST so the
-        simulator and the polar-align daemon are talking about the same
-        alt/az axes. The mount pole sits at the observer's true celestial
-        pole (alt = |lat|, az = 180 in the south, az = 0 in the north),
-        offset by the user's alt/az knobs; rotating around the polar axis
-        sweeps the camera around the mount pole at fixed mount Dec.
-        Because the camera is anchored in alt/az while the celestial frame
-        spins underneath it, the returned (RA, Dec) drifts at the sidereal
-        rate over real time — matching how a stationary real mount looks
-        to a real solver.
+        Like cam_radec_now but also returns the roll the camera *would* have
+        if it were rigidly attached to the simulated mount: its image-up
+        direction is the great-circle tangent from the optical axis toward
+        the mount pole. As the mount tilts/rotates, that tangent rotates
+        relative to celestial north, giving the camera a roll. Without this,
+        the PAFix chart's gnomonic projection of the real pole sits at
+        x_proj = 0 for all RA-axis values and the marker only ever moves
+        vertically — hence "the arrow never changes direction".
         """
         if not self.mount_enabled:
-            return self.cam_ra_deg, self.cam_dec_deg
+            return self.cam_ra_deg, self.cam_dec_deg, self.cam_roll_deg
 
         lat = self.obs_lat_rad
         lst = lst_rad(time.time(), self.obs_lon_rad)
 
-        # True celestial pole in horizon frame.
+        # True celestial pole + mount pole in horizon frame (as in cam_radec_now).
         true_pole_az_rad = 0.0 if lat >= 0 else np.pi
         true_pole_alt_rad = abs(lat)
-
-        # Mount pole offset by the alt/az knobs. Sign convention:
-        #   alt_offset_arcmin > 0 -> mount pole higher than true pole
-        #   az_offset_arcmin  > 0 -> mount pole east  of true pole's azimuth
         mount_alt = true_pole_alt_rad + np.radians(self.mount_alt_offset_arcmin / 60.0)
         mount_az  = true_pole_az_rad  + np.radians(self.mount_az_offset_arcmin  / 60.0)
         mount_pole_v = altaz_to_xyz(mount_alt, mount_az)
 
-        # Camera in horizon frame: at angle (90° − mount_dec) from the
-        # mount pole, swept around it by mount_ra_axis_deg. The "zero
-        # rotation" reference direction is perp to the mount pole — its
-        # exact orientation only changes which sky region the camera lands
-        # on at RA-axis = 0; the rotation IS the mount's RA drive.
+        # Camera optical axis at (90° − mount_dec) from mount pole, swept by
+        # mount_ra_axis_deg around it. Camera "up" is the tangent at the
+        # optical axis pointing toward the mount pole — the natural choice
+        # for a polar-aligned setup where the mount pole is "up" in the
+        # camera image. Both vectors rotate together as the mount turns.
         offset_from_pole = np.radians(90.0 - self.mount_dec_deg)
-        init = (mount_pole_v * np.cos(offset_from_pole)
-              + perp_unit(mount_pole_v) * np.sin(offset_from_pole))
-        cam_v_horizon = rotate_axis(init, mount_pole_v,
-                                    np.radians(self.mount_ra_axis_deg))
+        e1 = perp_unit(mount_pole_v)
+        optical_init = (mount_pole_v * np.cos(offset_from_pole)
+                       + e1 * np.sin(offset_from_pole))
+        up_init = (mount_pole_v * np.sin(offset_from_pole)
+                  - e1 * np.cos(offset_from_pole))
+        theta = np.radians(self.mount_ra_axis_deg)
+        optical_h = rotate_axis(optical_init, mount_pole_v, theta)
+        up_h      = rotate_axis(up_init,      mount_pole_v, theta)
 
-        cam_alt, cam_az = xyz_to_altaz(cam_v_horizon)
+        cam_alt, cam_az = xyz_to_altaz(optical_h)
         ra, dec = altaz_to_radec(cam_alt, cam_az, lat, lst)
-        return float(np.degrees(ra)), float(np.degrees(dec))
+
+        # Roll: angle from celestial-north tangent at the optical axis to
+        # the camera's up vector, measured around the optical axis. The
+        # NCP direction in the horizon frame is at alt=lat, az=0 (below
+        # the horizon for southern observers, above for northern); project
+        # it onto the plane perpendicular to the optical axis to get the
+        # celestial-north tangent there.
+        ncp_h = altaz_to_xyz(lat, 0.0)
+        n_hat = ncp_h - np.dot(ncp_h, optical_h) * optical_h
+        n_norm = np.linalg.norm(n_hat)
+        if n_norm < 1e-9:
+            roll = 0.0           # optical axis ≈ NCP; roll is degenerate
+        else:
+            n_hat /= n_norm
+            sin_r = np.dot(np.cross(n_hat, up_h), optical_h)
+            cos_r = np.dot(n_hat, up_h)
+            roll = float(np.arctan2(sin_r, cos_r))
+
+        return float(np.degrees(ra)), float(np.degrees(dec)), float(np.degrees(roll))
+
+    def cam_radec_now(self):
+        """Camera (RA, Dec) in degrees. Convenience wrapper for callers that
+        don't care about roll (e.g. the state panel)."""
+        ra, dec, _ = self.cam_radec_roll_now()
+        return ra, dec
 
     # ---- image regeneration ----
 
     async def regenerate_image(self):
         async with self._regen_lock:
-            ra_deg, dec_deg = self.cam_radec_now()
+            ra_deg, dec_deg, roll_deg = self.cam_radec_roll_now()
             # Heavy lifting off-thread.
             loop = asyncio.get_event_loop()
             img = await loop.run_in_executor(
                 None,
                 lambda: generate_star_field(
                     self.stars, ra_deg, dec_deg,
-                    fov_deg=self.cam_fov_deg, roll_deg=self.cam_roll_deg,
+                    fov_deg=self.cam_fov_deg, roll_deg=roll_deg,
                     width=self.args.width, height=self.args.height,
                     exposure_ms=self.exposure_ms, gain=self.gain,
                 ))
@@ -348,12 +369,12 @@ class Sim:
 
     def public_state(self):
         s = self.last_state
-        ra_deg, dec_deg = self.cam_radec_now()
+        ra_deg, dec_deg, roll_deg = self.cam_radec_roll_now()
         pa = s.get("pa") or {}
         return {
             "cam": {
                 "ra_deg":  ra_deg, "dec_deg": dec_deg,
-                "fov_deg": self.cam_fov_deg, "roll_deg": self.cam_roll_deg,
+                "fov_deg": self.cam_fov_deg, "roll_deg": roll_deg,
                 "exposure_ms": self.exposure_ms, "gain": self.gain,
             },
             "mount": {

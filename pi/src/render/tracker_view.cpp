@@ -31,12 +31,15 @@ void TrackerView::render(ICanvas &canvas, AppMode mode,
         break;
     }
     case AppMode::PAFix: {
-        // Prefer the live (tracker-updated) offset; fall back to the frozen
-        // fit if the tracker hasn't been initialised yet.
+        // Prefer the live (tracker-updated) pole + offset; fall back to the
+        // frozen fit if the tracker hasn't been initialised yet.
+        PoleEstimate mount_pole = (pa_fix && pa_fix->live_pole.valid)
+                                ? pa_fix->live_pole
+                                : aligner.estimate_pole();
         AltAzOffset offset = (pa_fix && pa_fix->live_pole.valid)
                            ? pa_fix->live_offset
-                           : aligner.pole_error(aligner.estimate_pole());
-        draw_pa_fix(canvas, offset, pa_fix);
+                           : aligner.pole_error(mount_pole);
+        draw_pa_fix(canvas, offset, mount_pole, pa_fix);
         break;
     }
     }
@@ -195,6 +198,37 @@ void draw_line(ICanvas &c, int x0, int y0, int x1, int y1) {
     }
 }
 
+// Apply the shortest-arc 3D rotation taking unit vector a to unit vector b,
+// to a third unit vector v. (Rodrigues, with c = a·b, s = |a×b|.) If a and b
+// are parallel within numerical noise, returns v unchanged.
+void rotate_a_to_b(const float a[3], const float b[3],
+                   const float v[3], float out[3]) {
+    float cos_t = a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    float ax_b[3] = {
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    };
+    float sin_t = std::sqrt(ax_b[0]*ax_b[0] +
+                            ax_b[1]*ax_b[1] +
+                            ax_b[2]*ax_b[2]);
+    if (sin_t < 1e-9f) {
+        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+        return;
+    }
+    float kx = ax_b[0] / sin_t, ky = ax_b[1] / sin_t, kz = ax_b[2] / sin_t;
+    float k_cross_v[3] = {
+        ky*v[2] - kz*v[1],
+        kz*v[0] - kx*v[2],
+        kx*v[1] - ky*v[0],
+    };
+    float k_dot_v = kx*v[0] + ky*v[1] + kz*v[2];
+    float omc = 1.0f - cos_t;
+    out[0] = cos_t*v[0] + sin_t*k_cross_v[0] + omc*k_dot_v*kx;
+    out[1] = cos_t*v[1] + sin_t*k_cross_v[1] + omc*k_dot_v*ky;
+    out[2] = cos_t*v[2] + sin_t*k_cross_v[2] + omc*k_dot_v*kz;
+}
+
 // 5-pixel arrowhead at (tx, ty), pointing along unit direction (ux, uy).
 // (tx, ty) is the tip. The two "fins" sit ~3 px back along -direction and
 // 2 px perpendicular.
@@ -212,20 +246,28 @@ void draw_arrowhead(ICanvas &c, int tx, int ty, float ux, float uy) {
 }  // namespace
 
 void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
+                              const PoleEstimate &mount_pole,
                               const PAFixState *pa_fix) {
-    // Camera-centred chart at a fixed 5° FOV. The star field is drawn around
+    // Camera-centred chart at a fixed 10' FOV. The star field is drawn around
     // the camera's actual pointing (with the camera's actual roll), so the
-    // operator sees the patch of sky the camera is on. The real celestial
-    // pole is drawn as a target marker; an arrow goes from chart centre
-    // toward it. As alignment improves, the mount slews the camera toward
-    // the pole, the marker walks in toward the centre, and the arrow
-    // shortens. When the marker is at the centre the mount points at the
-    // real pole — i.e. it's polar-aligned.
+    // operator sees the patch of sky the camera is on.
+    //
+    // The target marker is *not* the celestial pole. It's the sky position
+    // the camera will be looking at once the operator has dialled the alt/az
+    // knobs out — i.e. R * cam, where R is the shortest-arc rotation taking
+    // the mount's polar axis onto the true celestial pole. The whole mount
+    // moves rigidly with R, so this is where the camera ends up too. As
+    // alignment improves R → I, target → cam, and the marker walks in to
+    // the chart centre.
     constexpr int CHART_H = 48;                  // y: 0 .. 47
     constexpr int CHART_Y0 = 0;
     constexpr int CHART_Y1 = CHART_H - 1;
+    // 10 arcminute FOV — fine-alignment view. At ±5' from the centre, a
+    // properly polar-aligned mount with the camera near (but not on) the
+    // pole will have the pole inside the chart; bigger misalignments
+    // produce an edge arrow.
     constexpr float FOV_RAD =
-        5.0f * static_cast<float>(M_PI) / 180.0f;
+        (10.0f / 60.0f) * static_cast<float>(M_PI) / 180.0f;
 
     // Default to south if no state — matches the OBSERVER_LAT_DEG compile
     // default. With a PAFixState this is unused except for picking the pole.
@@ -246,15 +288,36 @@ void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
     star_map_.render(adapter, WIDTH, CHART_H,
                      cam_ra, cam_dec, FOV_RAD, cam_roll);
 
-    // Project the real celestial pole into chart space.
+    // Compute the alignment target: where the camera will be pointing once
+    // the mount has been rotated rigidly so its polar axis lands on the true
+    // celestial pole. Requires a valid mount-pole estimate; if we don't have
+    // one yet, skip the marker/arrow.
     int cx = WIDTH / 2;
     int cy = CHART_Y0 + CHART_H / 2;
     const float scale =
         static_cast<float>(WIDTH) / (2.0f * std::tan(FOV_RAD / 2.0f));
-    int px, py;
-    bool projected = gnomonic(0.0f, true_pole_dec,
-                              cam_ra, cam_dec, cam_roll, scale,
-                              cx, cy, px, py);
+    int px = 0, py = 0;
+    bool projected = false;
+    if (mount_pole.valid) {
+        auto to_vec = [](float ra, float dec, float v[3]) {
+            float cd = std::cos(dec);
+            v[0] = cd * std::cos(ra);
+            v[1] = cd * std::sin(ra);
+            v[2] = std::sin(dec);
+        };
+        float a[3], b[3], cv[3], tv[3];
+        to_vec(mount_pole.ra, mount_pole.dec, a);
+        to_vec(0.0f,           true_pole_dec, b);
+        to_vec(cam_ra,         cam_dec,       cv);
+        rotate_a_to_b(a, b, cv, tv);
+        float n = std::sqrt(tv[0]*tv[0] + tv[1]*tv[1] + tv[2]*tv[2]);
+        float z = (n > 0) ? std::clamp(tv[2] / n, -1.0f, 1.0f) : 0.0f;
+        float target_dec = std::asin(z);
+        float target_ra  = std::atan2(tv[1], tv[0]);
+        projected = gnomonic(target_ra, target_dec,
+                             cam_ra, cam_dec, cam_roll, scale,
+                             cx, cy, px, py);
+    }
 
     if (projected) {
         const int MARGIN = 4;
@@ -288,9 +351,9 @@ void TrackerView::draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
         }
 
         if (on_chart) {
-            // Target marker: small hollow square at the projected pole.
-            // (When the camera is exactly on the real pole, this lands on
-            // top of the star-map crosshair and reinforces "you're here".)
+            // Target marker: small hollow square at the alignment target.
+            // When the mount is polar-aligned, target == cam, so this lands
+            // on the chart centre and reinforces "you're here".
             canvas.draw_pixel(px - 1, py - 1);
             canvas.draw_pixel(px,     py - 1);
             canvas.draw_pixel(px + 1, py - 1);

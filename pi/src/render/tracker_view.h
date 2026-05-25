@@ -71,6 +71,7 @@ private:
     void draw_pa_sampling(ICanvas &canvas, int num_samples,
                           const PoleEstimate &pole, bool solved);
     void draw_pa_fix(ICanvas &canvas, const AltAzOffset &offset,
+                     const PoleEstimate &mount_pole,
                      const PAFixState *pa_fix);
 
     void draw_coord_bar(ICanvas &canvas, float ra_rad, float dec_rad);
