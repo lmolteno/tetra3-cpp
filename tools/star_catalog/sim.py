@@ -118,14 +118,17 @@ def img_to_png(img_u16, max_dim=512):
     h, w = img_u16.shape
     scale = max(w / max_dim, h / max_dim, 1.0)
     if scale > 1.0:
-        new_w = int(w / scale)
-        new_h = int(h / scale)
-        # Block-average downsample for speed; PIL.LANCZOS would be slightly
-        # nicer but a few percent of overall round-trip latency is unnoticeable.
-        sy = h // new_h
-        sx = w // new_w
-        img_u16 = img_u16[: sy * new_h, : sx * new_w].reshape(
-            new_h, sy, new_w, sx).mean(axis=(1, 3))
+        # Block-average downsample. Choose an *integer* block size first so
+        # the downsample covers the whole frame, then derive new_w/new_h from
+        # that. The naive `new_w = w // scale` rounds-down and then
+        # `sx = w // new_w` rounds-down again, which over a non-integer scale
+        # like 3.96 makes us cover only the upper-left of the frame (and the
+        # OLED preview ends up showing the lower-right of the camera image).
+        s = max(1, int(np.ceil(scale)))
+        new_w = w // s
+        new_h = h // s
+        img_u16 = img_u16[: s * new_h, : s * new_w].reshape(
+            new_h, s, new_w, s).mean(axis=(1, 3))
 
     arr = np.asarray(img_u16, dtype=np.float32)
     # Background-subtract by the median, then apply a sinh⁻¹ stretch so the
